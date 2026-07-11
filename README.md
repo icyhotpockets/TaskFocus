@@ -13,6 +13,11 @@ The application source is framework-free HTML, CSS, and JavaScript in `www/`. Ca
 - **Android:** rolling GitHub release with a stable `taskfocus.apk` asset
 - **Tests:** Node unit tests and Playwright mobile-browser checks before release
 
+### Install and test
+
+- **iPhone/PWA:** <https://icyhotpockets.github.io/TaskFocus/>
+- **Android APK:** <https://github.com/icyhotpockets/TaskFocus/releases/download/latest/taskfocus.apk>
+
 The permanent Android signing identity is held in protected GitHub Actions secrets, never in repository files.
 
 ## Project status

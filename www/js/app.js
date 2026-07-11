@@ -36,6 +36,7 @@ import {
 } from "./themes.js";
 
 const VALID_ROUTES = new Set(["tasks", "calendar", "settings"]);
+const CATEGORY_HEXES = CATEGORY_COLORS.map(({ hex }) => hex);
 
 const view = document.querySelector("#view");
 const sheetsRoot = document.querySelector("#sheets");
@@ -945,7 +946,7 @@ function renderOptionPanel(option, draft) {
     <section class="option-panel" data-option-panel="color">
       <div class="color-picker" role="group" aria-label="Task color">
         <button class="color-choice none ${!draft.color ? "selected" : ""}" type="button" data-action="set-draft-color" data-color="" aria-label="No color">×</button>
-        ${CATEGORY_COLORS.map((color) => `<button class="color-choice ${draft.color === color ? "selected" : ""}" type="button" data-action="set-draft-color" data-color="${color}" style="--swatch:${color}" aria-label="Choose ${color}"></button>`).join("")}
+        ${CATEGORY_HEXES.map((color) => `<button class="color-choice ${draft.color === color ? "selected" : ""}" type="button" data-action="set-draft-color" data-color="${color}" style="--swatch:${color}" aria-label="Choose ${color}"></button>`).join("")}
       </div>
     </section>`;
   if (option === "tags") return `
@@ -1225,7 +1226,7 @@ function setDraftPriority(priority) {
 
 function setDraftColor(color) {
   if (currentSheet?.type !== "editor") return;
-  currentSheet.draft.color = CATEGORY_COLORS.includes(String(color).toLowerCase()) ? String(color).toLowerCase() : null;
+  currentSheet.draft.color = CATEGORY_HEXES.includes(String(color).toLowerCase()) ? String(color).toLowerCase() : null;
   renderEditorSheet();
 }
 
@@ -1559,7 +1560,7 @@ function parentTitle(task) {
 
 function safeColor(value) {
   const normalized = String(value).toLowerCase();
-  return CATEGORY_COLORS.includes(normalized) ? normalized : "var(--text-faint)";
+  return CATEGORY_HEXES.includes(normalized) ? normalized : "var(--text-faint)";
 }
 
 function escapeHtml(value) {

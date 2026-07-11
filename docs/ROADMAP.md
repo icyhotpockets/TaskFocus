@@ -1,5 +1,14 @@
 # TaskFocus build roadmap
 
+## Current delivery status
+
+- **Released:** Phase 1 delivery foundation.
+- **In the next verified build:** full task option chips, removable quick-add chips, Category/Tags filter sheets, backup/restore, quiet-hours editing, and start/stop focus sessions.
+- **Next build after that:** Phase 3 hierarchy, gestures, completion cascade/animation, and Clear all.
+- **Not delivered yet:** native alarm scheduling/actions and the iPhone Web Push backend.
+
+The Settings screen also carries a short build-status card so phone testers can see which layer is present in the APK they are using.
+
 ## Phase 1 — delivery foundation
 
 - Mobile application shell and approved theme tokens

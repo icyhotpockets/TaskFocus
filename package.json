@@ -1,0 +1,28 @@
+{
+  "name": "taskfocus",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Offline-first TaskFocus app for Android and iPhone PWA",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test tests/unit/*.test.js",
+    "test:unit": "node --test tests/unit/*.test.js",
+    "test:e2e": "node scripts/e2e-smoke.mjs",
+    "serve": "node scripts/static-server.mjs www 4173",
+    "cap:sync": "cap sync android",
+    "android:release": "npm run cap:sync && cd android && ./gradlew assembleRelease"
+  },
+  "dependencies": {
+    "@capacitor/app": "7.1.2",
+    "@capacitor/core": "7.6.7",
+    "@capacitor/local-notifications": "7.0.7"
+  },
+  "devDependencies": {
+    "@capacitor/android": "7.6.7",
+    "@capacitor/cli": "7.6.7",
+    "@playwright/test": "1.61.1"
+  }
+}

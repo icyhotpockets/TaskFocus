@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 180" role="img" aria-label="TaskFocus">
+  <rect width="180" height="180" rx="39" fill="#1b2026"/>
+  <circle cx="90" cy="90" r="55" fill="#242b33" stroke="#a63446" stroke-width="11"/>
+  <path d="m58 92 22 22 44-53" fill="none" stroke="#e8eaed" stroke-linecap="round" stroke-linejoin="round" stroke-width="13"/>
+</svg>

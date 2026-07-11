@@ -1,0 +1,9 @@
+{
+  "appId": "com.icyhotpockets.taskfocus",
+  "appName": "TaskFocus",
+  "webDir": "www",
+  "android": {
+    "allowMixedContent": false,
+    "backgroundColor": "#1b2026"
+  }
+}

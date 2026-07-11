@@ -1,0 +1,76 @@
+name: Deploy Pages
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  stage:
+    name: Stage verified web app
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the exact tested commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Stamp immutable build identity
+        run: >-
+          node scripts/stage-web.mjs
+          --source www
+          --output dist/pages
+          --build "${{ github.event.workflow_run.head_sha }}"
+          --version-code "${{ github.event.workflow_run.run_number }}"
+          --version-name "1.0.${{ github.event.workflow_run.run_number }}"
+
+      - name: Check GitHub Pages availability
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh api "repos/${GITHUB_REPOSITORY}/pages" >/dev/null 2>&1; then
+            echo "::error title=GitHub Pages is not enabled::Open repository Settings → Pages and choose GitHub Actions. Private personal repositories also require a GitHub plan that includes private Pages."
+            exit 1
+          fi
+
+      - name: Configure Pages metadata
+        uses: actions/configure-pages@v6
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist/pages
+          include-hidden-files: true
+
+  deploy:
+    name: Publish iPhone PWA
+    needs: stage
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

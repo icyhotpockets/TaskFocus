@@ -1,0 +1,127 @@
+name: Release Android APK
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-rolling-release
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Build signed rolling APK
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TASKFOCUS_VERSION_CODE: ${{ github.event.workflow_run.run_number }}
+      TASKFOCUS_VERSION_NAME: 1.0.${{ github.event.workflow_run.run_number }}
+    steps:
+      - name: Check out the exact tested commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+
+      - name: Install pinned dependencies
+        run: npm ci
+
+      - name: Restore permanent signing identity
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "${ANDROID_KEYSTORE_B64}" ] || [ -z "${ANDROID_KEYSTORE_PASSWORD}" ] || [ -z "${ANDROID_KEY_ALIAS}" ] || [ -z "${ANDROID_KEY_PASSWORD}" ]; then
+            echo "::error title=Android signing secrets missing::Add the four TaskFocus Android signing secrets in repository Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          printf '%s' "${ANDROID_KEYSTORE_B64}" | base64 --decode > android/app/taskfocus-release.keystore
+          {
+            printf 'storeFile=app/taskfocus-release.keystore\n'
+            printf 'storePassword=%s\n' "${ANDROID_KEYSTORE_PASSWORD}"
+            printf 'keyAlias=%s\n' "${ANDROID_KEY_ALIAS}"
+            printf 'keyPassword=%s\n' "${ANDROID_KEY_PASSWORD}"
+          } > android/keystore.properties
+          keytool -list -keystore android/app/taskfocus-release.keystore -storepass "${ANDROID_KEYSTORE_PASSWORD}" -alias "${ANDROID_KEY_ALIAS}" >/dev/null
+
+      - name: Stamp build number for Settings and diagnostics
+        run: >-
+          node scripts/write-version.mjs
+          --output www/version.json
+          --build "${{ github.event.workflow_run.head_sha }}"
+          --version-code "${TASKFOCUS_VERSION_CODE}"
+          --version-name "${TASKFOCUS_VERSION_NAME}"
+
+      - name: Sync the verified web app into Capacitor
+        run: npx cap sync android
+
+      - name: Build the permanently signed APK
+        working-directory: android
+        run: ./gradlew --no-daemon assembleRelease
+
+      - name: Name and verify the APK
+        run: |
+          cp android/app/build/outputs/apk/release/app-release.apk taskfocus.apk
+          APKSIGNER="$(find "${ANDROID_HOME}/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          if [ -z "${APKSIGNER}" ]; then
+            echo "::error title=Android build tools missing::Could not locate apksigner under ANDROID_HOME."
+            exit 1
+          fi
+          "${APKSIGNER}" verify --verbose --print-certs taskfocus.apk | tee /tmp/taskfocus-signature.txt
+          grep -qi "55915acfcf6dffdd02e617fb8089d58b427ebde4c8541aae525202e9c2561d1f" /tmp/taskfocus-signature.txt
+
+      - name: Preserve a per-build Actions artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: taskfocus-build-${{ github.run_number }}
+          path: taskfocus.apk
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Move the stable tag to this tested build
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag --force latest "${HEAD_SHA}"
+          git push origin refs/tags/latest --force
+
+      - name: Create or update the rolling phone release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          RELEASE_TITLE="TaskFocus build ${TASKFOCUS_VERSION_CODE}"
+          RELEASE_NOTES="Signed Android build ${TASKFOCUS_VERSION_NAME} (${HEAD_SHA}). Install taskfocus.apk over the existing app; never uninstall unless you exported your tasks first. If Android reports App not installed, delete stale taskfocus.apk downloads and download it again."
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest taskfocus.apk --clobber
+            gh release edit latest --title "${RELEASE_TITLE}" --notes "${RELEASE_NOTES}" --latest
+          else
+            gh release create latest taskfocus.apk --title "${RELEASE_TITLE}" --notes "${RELEASE_NOTES}" --latest
+          fi

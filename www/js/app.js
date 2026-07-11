@@ -4,9 +4,26 @@ import {
   STORAGE_KEY,
   createEmptyData,
   migrateData,
+  prepareImportedData,
+  serializeData,
+  validateDataDocument,
   withAddedTask,
 } from "./core/data.js";
+import {
+  filterTasks,
+  hasActiveFilters,
+  inUseColors,
+  inUseTags,
+  searchTags,
+} from "./core/filters.js";
 import { pickFocusTasks, groupTasksByDate } from "./core/focus.js";
+import {
+  completeWithDescendants,
+  deleteTask as deleteTaskFromModel,
+  restoreTaskStates,
+  setArchived,
+} from "./core/model.js";
+import { expireFinishedSessions, sessionState } from "./core/notifications.js";
 import { parseQuickAdd } from "./core/parser.js";
 import { CATEGORY_COLORS } from "./core/themes.js";
 import { checkForNativeUpdate } from "./update.js";
@@ -34,7 +51,9 @@ let calendarCursor = startOfMonth(new Date());
 let selectedCalendarDate = dateKey(new Date());
 let buildLabel = "development";
 let buildVersionName = "development";
+let activeFilters = { colors: [], tags: [] };
 const routeScroll = new Map();
+let touchAction = null;
 
 applyTheme(documentState.settings.theme);
 ensureRoute();
@@ -53,6 +72,8 @@ setInterval(() => {
 window.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
     loadBuildVersion({ reloadOnChange: true });
+    reconcileFinishedSessions();
+    if (!currentSheet) rerender();
   }
 });
 
@@ -68,7 +89,14 @@ function loadDocument() {
   for (const key of [STORAGE_KEY, BACKUP_KEY]) {
     try {
       const raw = localStorage.getItem(key);
-      if (raw) return normalizeDocument(JSON.parse(raw));
+      if (!raw) continue;
+      const parsed = JSON.parse(raw);
+      const loadable = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        && Array.isArray(parsed.tasks)
+        && parsed.tasks.every((task) => task && typeof task === "object" && !Array.isArray(task) && typeof task.title === "string");
+      if (!loadable) continue;
+      const normalized = normalizeDocument(parsed);
+      if (validateDataDocument(normalized).valid) return normalized;
     } catch {
       // Try the last-known-good copy, then start clean.
     }
@@ -78,15 +106,20 @@ function loadDocument() {
 
 function scheduleSave() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    try {
-      const current = localStorage.getItem(STORAGE_KEY);
-      if (current) localStorage.setItem(BACKUP_KEY, current);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(documentState));
-    } catch {
-      showToast("TaskFocus could not save this change.");
-    }
-  }, 250);
+  saveTimer = setTimeout(() => persistDocumentNow(), 250);
+}
+
+function persistDocumentNow(nextDocument = documentState, { backupDocument = null } = {}) {
+  clearTimeout(saveTimer);
+  try {
+    const current = backupDocument ? JSON.stringify(backupDocument) : localStorage.getItem(STORAGE_KEY);
+    if (current) localStorage.setItem(BACKUP_KEY, current);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(nextDocument));
+    return true;
+  } catch {
+    showToast("TaskFocus could not save this change.");
+    return false;
+  }
 }
 
 function routeFromHash() {
@@ -112,54 +145,19 @@ function bindShellEvents() {
 
   document.addEventListener("click", (event) => {
     const actionTarget = event.target.closest("[data-action]");
-    if (!actionTarget) return;
-    const { action } = actionTarget.dataset;
+    if (actionTarget) handleAction(actionTarget, event);
 
-    if (action === "close-sheet") {
-      closeSheet();
-    } else if (action === "add-task") {
-      submitAddTask();
-    } else if (action === "toggle-task") {
-      event.stopPropagation();
-      toggleTask(Number(actionTarget.dataset.taskId));
-    } else if (action === "edit-task") {
-      openEditSheet(Number(actionTarget.dataset.taskId));
-    } else if (action === "save-edit") {
-      saveTaskEdit(Number(actionTarget.dataset.taskId));
-    } else if (action === "delete-task") {
-      deleteTask(Number(actionTarget.dataset.taskId));
-    } else if (action === "theme-family") {
-      selectedThemeFamily = actionTarget.dataset.family;
-      rerender();
-    } else if (action === "theme") {
-      selectTheme(actionTarget.dataset.theme);
-    } else if (action === "focus-limit") {
-      documentState.settings.focusLimit = Number(actionTarget.dataset.value);
-      scheduleSave();
-      rerender();
-    } else if (action === "calendar-prev") {
-      calendarCursor = new Date(calendarCursor.getFullYear(), calendarCursor.getMonth() - 1, 1);
-      rerender();
-    } else if (action === "calendar-next") {
-      calendarCursor = new Date(calendarCursor.getFullYear(), calendarCursor.getMonth() + 1, 1);
-      rerender();
-    } else if (action === "calendar-today") {
-      calendarCursor = startOfMonth(new Date());
-      selectedCalendarDate = dateKey(new Date());
-      rerender();
-    } else if (action === "calendar-select") {
-      selectedCalendarDate = actionTarget.dataset.date;
-      const selected = parseDateKey(selectedCalendarDate);
-      calendarCursor = startOfMonth(selected);
-      rerender();
-    } else if (action === "placeholder") {
-      showToast("This control is ready for the next build round.");
+    const picker = event.target.closest("[data-show-picker]");
+    if (picker?.showPicker) {
+      try { picker.showPicker(); } catch { /* The native picker still opens normally where supported. */ }
     }
   });
 
   sheetsRoot.addEventListener("input", (event) => {
-    if (event.target.id === "quick-task-input") updateParsedPreview(event.target.value);
+    handleSheetInput(event.target, event.type);
   });
+
+  sheetsRoot.addEventListener("change", (event) => handleSheetInput(event.target, event.type));
 
   sheetsRoot.addEventListener("keydown", (event) => {
     if (event.key === "Escape") closeSheet();
@@ -168,9 +166,105 @@ function bindShellEvents() {
       submitAddTask();
     }
   });
+
+  document.addEventListener("touchstart", (event) => {
+    const target = event.target.closest("[data-touch-action], #sheets button[data-action]");
+    if (!target || event.touches.length !== 1) return;
+    const touch = event.touches[0];
+    touchAction = { target, x: touch.clientX, y: touch.clientY, startedAt: Date.now() };
+  }, { passive: true });
+
+  document.addEventListener("touchend", (event) => {
+    if (!touchAction) return;
+    const ended = event.changedTouches[0];
+    const pending = touchAction;
+    touchAction = null;
+    event.preventDefault();
+    if (!ended || Date.now() - pending.startedAt > 600
+      || Math.hypot(ended.clientX - pending.x, ended.clientY - pending.y) > 12) return;
+    handleAction(pending.target, event);
+  }, { passive: false });
+
+  document.addEventListener("touchcancel", () => { touchAction = null; }, { passive: true });
+}
+
+function handleAction(actionTarget, event) {
+  const { action } = actionTarget.dataset;
+  if (action === "close-sheet" || action === "filter-done") {
+    closeSheet();
+  } else if (action === "add-task") {
+    submitAddTask();
+  } else if (action === "toggle-task") {
+    event?.stopPropagation();
+    toggleTask(Number(actionTarget.dataset.taskId));
+  } else if (action === "edit-task") {
+    openEditSheet(Number(actionTarget.dataset.taskId));
+  } else if (action === "save-edit") {
+    saveTaskEdit(Number(actionTarget.dataset.taskId));
+  } else if (action === "delete-task") {
+    deleteTask(Number(actionTarget.dataset.taskId));
+  } else if (action === "confirm-delete-task") {
+    deleteTask(Number(actionTarget.dataset.taskId), true);
+  } else if (action === "open-category-filter") {
+    openFilterSheet("colors");
+  } else if (action === "open-tag-filter") {
+    openFilterSheet("tags");
+  } else if (action === "toggle-filter-color") {
+    toggleFilter("colors", actionTarget.dataset.filterColor);
+  } else if (action === "toggle-filter-tag") {
+    toggleFilter("tags", actionTarget.dataset.filterTag);
+  } else if (action === "clear-filters") {
+    clearFilters(actionTarget.dataset.filterKind);
+  } else if (action === "task-option") {
+    toggleTaskOption(actionTarget.dataset.option);
+  } else if (action === "remove-parsed") {
+    removeParsedType(actionTarget.dataset.type);
+  } else if (action === "set-draft-priority") {
+    setDraftPriority(Number(actionTarget.dataset.priority));
+  } else if (action === "set-draft-color") {
+    setDraftColor(actionTarget.dataset.color || null);
+  } else if (action === "toggle-session") {
+    event?.stopPropagation();
+    toggleSession(Number(actionTarget.dataset.taskId));
+  } else if (action === "theme-family") {
+    selectedThemeFamily = actionTarget.dataset.family;
+    rerender();
+  } else if (action === "theme") {
+    selectTheme(actionTarget.dataset.theme);
+  } else if (action === "focus-limit") {
+    documentState.settings.focusLimit = Number(actionTarget.dataset.value);
+    scheduleSave();
+    rerender();
+  } else if (action === "calendar-prev") {
+    calendarCursor = new Date(calendarCursor.getFullYear(), calendarCursor.getMonth() - 1, 1);
+    rerender();
+  } else if (action === "calendar-next") {
+    calendarCursor = new Date(calendarCursor.getFullYear(), calendarCursor.getMonth() + 1, 1);
+    rerender();
+  } else if (action === "calendar-today") {
+    calendarCursor = startOfMonth(new Date());
+    selectedCalendarDate = dateKey(new Date());
+    rerender();
+  } else if (action === "calendar-select") {
+    selectedCalendarDate = actionTarget.dataset.date;
+    const selected = parseDateKey(selectedCalendarDate);
+    calendarCursor = startOfMonth(selected);
+    rerender();
+  } else if (action === "export-backup") {
+    exportBackup();
+  } else if (action === "import-backup") {
+    chooseImportBackup();
+  } else if (action === "confirm-import") {
+    confirmImport();
+  } else if (action === "open-quiet-hours") {
+    openQuietHoursSheet();
+  } else if (action === "save-quiet-hours") {
+    saveQuietHours();
+  }
 }
 
 function rerender({ entry = false, restoreRouteScroll = false } = {}) {
+  reconcileFinishedSessions();
   const scrollTop = restoreRouteScroll ? routeScroll.get(currentRoute) || 0 : window.scrollY;
   const openDetails = new Set(
     [...view.querySelectorAll("details[open][data-detail-key]")].map((node) => node.dataset.detailKey),
@@ -198,6 +292,14 @@ function rerender({ entry = false, restoreRouteScroll = false } = {}) {
   requestAnimationFrame(() => window.scrollTo({ top: scrollTop, behavior: "auto" }));
 }
 
+function reconcileFinishedSessions() {
+  const reconciled = expireFinishedSessions(documentState.tasks);
+  if (!reconciled.expiredIds.length) return false;
+  documentState.tasks = reconciled.tasks;
+  scheduleSave();
+  return true;
+}
+
 function renderTasksView() {
   const now = new Date();
   const open = documentState.tasks.filter((task) => !task.archived && !task.completedAt);
@@ -211,6 +313,8 @@ function renderTasksView() {
   const focusIds = new Set(focus.map((task) => task.id));
   const remaining = open.filter((task) => !focusIds.has(task.id));
   const groups = groupTasksByDate(remaining, now.getTime());
+  const filtering = hasActiveFilters(activeFilters);
+  const filtered = filtering ? filterTasks(open, activeFilters) : [];
   const greeting = now.getHours() < 12 ? "Good morning" : now.getHours() < 18 ? "Good afternoon" : "Good evening";
   const dateText = new Intl.DateTimeFormat(undefined, {
     weekday: "long",
@@ -227,13 +331,20 @@ function renderTasksView() {
       </header>
 
       <div class="filter-row" aria-label="Task filters">
-        <button class="chip" type="button" data-action="placeholder">
-          <span class="chip-dot" style="--chip-color:var(--accent-bright)"></span> Category
+        <button class="chip ${activeFilters.colors.length ? "active" : ""}" type="button" data-action="open-category-filter">
+          <span class="chip-dot" style="--chip-color:var(--accent-bright)"></span>
+          Category${activeFilters.colors.length ? ` · ${activeFilters.colors.length}` : ""}
         </button>
-        <button class="chip" type="button" data-action="placeholder"># Tags</button>
+        <button class="chip ${activeFilters.tags.length ? "active" : ""}" type="button" data-action="open-tag-filter">
+          # Tags${activeFilters.tags.length ? ` · ${activeFilters.tags.length}` : ""}
+        </button>
       </div>
 
-      ${open.length === 0 ? renderEmptyState() : `
+      ${filtering ? `
+        ${filtered.length
+          ? renderTaskSection("Filtered tasks", filtered, "filtered", false, true)
+          : renderNoFilterMatches()}
+      ` : open.length === 0 ? renderEmptyState() : `
         ${focus.length ? renderTaskSection("Your focus", focus, "focus", true) : ""}
         ${groups.overdue.length ? renderTaskSection("Overdue", groups.overdue, "overdue") : ""}
         ${groups.today.length ? renderTaskSection("Today", groups.today, "today") : ""}
@@ -243,6 +354,18 @@ function renderTasksView() {
 
       ${renderDoneSection(doneRoots)}
     </div>
+  `;
+}
+
+function renderNoFilterMatches() {
+  return `
+    <section class="empty-state compact" style="--i:0">
+      <div>
+        <h2>No matches.</h2>
+        <p>Try another category or tag.</p>
+        <button class="button ghost" type="button" data-action="clear-filters">Clear filters</button>
+      </div>
+    </section>
   `;
 }
 
@@ -261,14 +384,16 @@ function renderEmptyState() {
   `;
 }
 
-function renderTaskSection(title, tasks, key, focus = false) {
+function renderTaskSection(title, tasks, key, focus = false, parentLabels = false) {
   return `
     <section class="section" aria-labelledby="section-${key}">
       <div class="section-heading-row">
         <h2 id="section-${key}">${escapeHtml(title)}</h2>
         <span class="section-count">${tasks.length}${focus ? ` of ${documentState.settings.focusLimit}` : ""}</span>
       </div>
-      <div class="task-list">${tasks.map((task, index) => renderTaskCard(task, index)).join("")}</div>
+      <div class="task-list">${tasks.map((task, index) => renderTaskCard(task, index, {
+        parentLabel: parentLabels ? parentTitle(task) : "",
+      })).join("")}</div>
     </section>
   `;
 }
@@ -281,6 +406,9 @@ function renderTaskCard(task, index = 0, { parentLabel = "" } = {}) {
       ? `<span class="chip">⏱ ${task.timer.durationMin}m</span>`
       : "";
   const priority = task.priority === 2 ? `<span class="chip priority-high">high</span>` : "";
+  const reminder = task.reminder
+    ? `<span class="chip pending">every ${formatMinutes(task.reminder.intervalMin)} · delivery pending</span>`
+    : "";
   const category = task.color
     ? `<span class="chip"><span class="chip-dot" style="--chip-color:${safeColor(task.color)}"></span> category</span>`
     : "";
@@ -296,12 +424,12 @@ function renderTaskCard(task, index = 0, { parentLabel = "" } = {}) {
         <div class="task-content">
           ${parentLabel ? `<p class="parent-label">${escapeHtml(parentLabel)}</p>` : ""}
           <p class="task-title">${escapeHtml(task.title)}</p>
-          ${due || timer || priority || category || tag ? `<div class="task-meta">${category}${due}${timer}${priority}${tag}</div>` : ""}
+          ${due || timer || reminder || priority || category || tag ? `<div class="task-meta">${category}${due}${timer}${priority}${reminder}${tag}</div>` : ""}
         </div>
         <div class="task-trailing">
-          ${task.timer || task.breaks ? `
-            <button class="icon-button" type="button" data-action="placeholder" aria-label="Start focus session">
-              <svg viewBox="0 0 24 24"><path d="m9 7 8 5-8 5Z"></path></svg>
+          ${!done && (task.timer || task.breaks) ? `
+            <button class="icon-button ${task.session ? "session-active" : ""}" type="button" data-action="toggle-session" data-task-id="${task.id}" aria-label="${task.session ? "Stop" : "Start"} focus session">
+              <svg viewBox="0 0 24 24">${task.session ? '<rect x="8" y="8" width="8" height="8" rx="1"></rect>' : '<path d="m9 7 8 5-8 5Z"></path>'}</svg>
             </button>
           ` : ""}
           <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" style="fill:none;stroke:var(--text-faint);stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><path d="m9 6 6 6-6 6"></path></svg>
@@ -340,9 +468,9 @@ function dueChip(task) {
 }
 
 function sessionTimeLabel(task) {
-  const elapsed = Math.max(0, Date.now() - Number(task.session.startedAt));
-  const total = (task.timer?.durationMin || task.breaks?.workMin || 25) * 60_000;
-  return `${Math.max(0, Math.ceil((total - elapsed) / 60_000))}m left`;
+  const state = sessionState(task, Date.now());
+  const phase = state.phase === "break" ? "break · " : "";
+  return `${phase}${Math.max(0, Math.ceil(state.remainingMs / 60_000))}m left`;
 }
 
 function renderCalendarView() {
@@ -440,12 +568,12 @@ function renderSettingsView() {
             <span class="platform-pill">${escapeHtml(platformName())}</span>
           </div>
           <div class="setting-row">
-            <div class="setting-label"><strong>Permission</strong><span>Not enabled yet</span></div>
-            <button class="button" type="button" data-action="placeholder">Enable</button>
+            <div class="setting-label"><strong>Permission</strong><span>Delivery setup comes in the notification build</span></div>
+            <button class="button" type="button" disabled>Next round</button>
           </div>
           <div class="setting-row">
             <div class="setting-label"><strong>Quiet hours</strong><span>${documentState.settings.quietStart}–${documentState.settings.quietEnd}</span></div>
-            <button class="button ghost" type="button" data-action="placeholder">Edit</button>
+            <button class="button ghost" type="button" data-action="open-quiet-hours">Edit</button>
           </div>
         </section>
 
@@ -479,15 +607,26 @@ function renderSettingsView() {
           </div>
           <div class="setting-row">
             <div class="setting-label"><strong>Export backup</strong><span>Save or share a JSON copy</span></div>
-            <button class="button" type="button" data-action="placeholder">Export</button>
+            <button class="button" type="button" data-action="export-backup">Export</button>
           </div>
           <div class="setting-row">
             <div class="setting-label"><strong>Import backup</strong><span>Replace tasks from a saved copy</span></div>
-            <button class="button ghost" type="button" data-action="placeholder">Import</button>
+            <button class="button ghost" type="button" data-action="import-backup">Import</button>
           </div>
         </section>
 
         <section class="settings-card" style="--i:4">
+          <div class="settings-card-header">
+            <div><h2>Build status</h2><p>What works now and what comes next.</p></div>
+          </div>
+          <div class="build-status-list">
+            <div class="build-status-row"><span>Task editor, filters, backup, basic focus timer</span><span class="status-pill ready">Ready</span></div>
+            <div class="build-status-row"><span>Subtasks, gestures, completion animation</span><span class="status-pill next">Next</span></div>
+            <div class="build-status-row"><span>Background reminders and iPhone push</span><span class="status-pill planned">Planned</span></div>
+          </div>
+        </section>
+
+        <section class="settings-card" style="--i:5">
           <div class="about-mark">
             <div class="about-logo" aria-hidden="true">TF</div>
             <div class="setting-label">
@@ -501,69 +640,364 @@ function renderSettingsView() {
   `;
 }
 
-function openAddSheet() {
-  currentSheet = { type: "add" };
+function openFilterSheet(kind) {
+  currentSheet = { type: "filter", kind, query: "" };
   document.body.classList.add("sheet-open");
+  renderFilterSheet({ focusSearch: kind === "tags" });
+}
+
+function renderFilterSheet({ focusSearch = false } = {}) {
+  if (currentSheet?.type !== "filter") return;
+  const previousScroll = sheetsRoot.querySelector(".sheet")?.scrollTop || 0;
+  const searchWasFocused = document.activeElement?.matches?.('[data-filter-search="tags"]');
+  const { kind } = currentSheet;
+  const isTags = kind === "tags";
+  const openTasks = documentState.tasks.filter((task) => !task.archived);
+  const allColors = [...new Set([...inUseColors(openTasks), ...activeFilters.colors])];
+  const allTags = [...new Set([...inUseTags(openTasks), ...activeFilters.tags])].sort((a, b) => a.localeCompare(b));
+  const visibleTags = searchTags(allTags, currentSheet.query);
+  const choices = isTags
+    ? renderTagFilterChoices(visibleTags)
+    : renderColorFilterChoices(allColors);
+
   sheetsRoot.innerHTML = `
     <div class="sheet-layer" role="presentation">
-      <button class="sheet-scrim" type="button" data-action="close-sheet" aria-label="Close add task"></button>
-      <section class="sheet" role="dialog" aria-modal="true" aria-labelledby="add-sheet-title">
+      <button class="sheet-scrim" type="button" data-action="close-sheet" aria-label="Close filters"></button>
+      <section class="sheet filter-sheet" role="dialog" aria-modal="true" aria-labelledby="filter-sheet-title">
         <div class="sheet-grabber" aria-hidden="true"></div>
         <header class="sheet-header">
-          <h2 class="sheet-title" id="add-sheet-title">Add task</h2>
+          <div>
+            <h2 class="sheet-title" id="filter-sheet-title">${isTags ? "Filter by tags" : "Filter by category"}</h2>
+            <p class="sheet-subtitle">Choose more than one to match any selected ${isTags ? "tag" : "category"}.</p>
+          </div>
           <button class="sheet-close" type="button" data-action="close-sheet" aria-label="Close">×</button>
         </header>
-        <label class="field">
-          <span class="field-label">What do you need to do?</span>
-          <input class="input quick-input" id="quick-task-input" type="text" autocomplete="off" placeholder="Call Mom tomorrow 5pm #family">
-        </label>
-        <div class="chip-row" id="parsed-preview"></div>
-        <p class="parse-hint">Try a day, time, priority, or #tag. You can refine it later.</p>
-        <div class="option-toolbar" aria-label="Task options">
-          ${["Date", "Timing", "Priority", "Color", "Tags", "Notes"].map((label) => `<button class="chip" type="button" data-action="placeholder">${label}</button>`).join("")}
+        ${isTags ? `
+          <label class="field">
+            <span class="field-label">Search tags</span>
+            <input class="input" type="search" value="${escapeAttribute(currentSheet.query)}" data-filter-search="tags" placeholder="Search tags">
+          </label>
+        ` : ""}
+        <div class="filter-choice-grid" data-filter-choices="${kind}">
+          ${choices || `<p class="muted small">${isTags ? "No tags yet." : "No categories are in use yet."}</p>`}
         </div>
-        <div class="sheet-actions single">
-          <button class="button primary full" type="button" data-action="add-task">Add task</button>
+        <div class="sheet-actions">
+          <button class="button ghost" type="button" data-action="clear-filters" data-filter-kind="${kind}">Clear</button>
+          <button class="button primary" type="button" data-action="filter-done">Done</button>
         </div>
       </section>
     </div>
   `;
-  const input = sheetsRoot.querySelector("#quick-task-input");
-  requestAnimationFrame(() => input?.focus({ preventScroll: true }));
+  bindSheetDrag();
+  requestAnimationFrame(() => {
+    const sheet = sheetsRoot.querySelector(".sheet");
+    if (sheet) sheet.scrollTop = previousScroll;
+    if (focusSearch || searchWasFocused) {
+      const search = sheetsRoot.querySelector('[data-filter-search="tags"]');
+      search?.focus({ preventScroll: true });
+      search?.setSelectionRange(search.value.length, search.value.length);
+    }
+  });
+}
+
+function renderTagFilterChoices(tags) {
+  return tags.map((tag) => {
+    const active = activeFilters.tags.includes(tag);
+    return `<button class="chip filter-choice ${active ? "active" : ""}" type="button"
+      data-action="toggle-filter-tag" data-filter-tag="${escapeAttribute(tag)}" aria-pressed="${active}">#${escapeHtml(tag)}</button>`;
+  }).join("");
+}
+
+function renderColorFilterChoices(colors) {
+  return colors.map((color) => {
+    const active = activeFilters.colors.includes(color);
+    return `<button class="color-filter-choice ${active ? "selected" : ""}" type="button"
+      data-action="toggle-filter-color" data-filter-color="${color}" data-color="${color}"
+      style="--swatch:${color}" aria-label="${color} category" aria-pressed="${active}">
+      <span class="color-swatch" aria-hidden="true"></span>
+    </button>`;
+  }).join("");
+}
+
+function toggleFilter(kind, value) {
+  if (!value || !["colors", "tags"].includes(kind)) return;
+  const values = activeFilters[kind];
+  activeFilters = {
+    ...activeFilters,
+    [kind]: values.includes(value) ? values.filter((item) => item !== value) : [...values, value],
+  };
+  rerender();
+  renderFilterSheet();
+}
+
+function clearFilters(kind) {
+  if (kind === "colors" || kind === "tags") activeFilters = { ...activeFilters, [kind]: [] };
+  else activeFilters = { colors: [], tags: [] };
+  rerender();
+  if (currentSheet?.type === "filter") renderFilterSheet();
+}
+
+function openQuietHoursSheet() {
+  currentSheet = { type: "quiet-hours" };
+  document.body.classList.add("sheet-open");
+  sheetsRoot.innerHTML = `
+    <div class="sheet-layer" role="presentation">
+      <button class="sheet-scrim" type="button" data-action="close-sheet" aria-label="Close quiet hours"></button>
+      <section class="sheet" role="dialog" aria-modal="true" aria-labelledby="quiet-title">
+        <div class="sheet-grabber" aria-hidden="true"></div>
+        <header class="sheet-header">
+          <div><h2 class="sheet-title" id="quiet-title">Quiet hours</h2><p class="sheet-subtitle">Interval reminders wait until quiet hours end. Due-time alerts still fire when you chose.</p></div>
+          <button class="sheet-close" type="button" data-action="close-sheet" aria-label="Close">×</button>
+        </header>
+        <div class="date-fields">
+          <label class="field"><span class="field-label">Start</span><input class="input" id="quiet-start" type="time" data-show-picker value="${escapeAttribute(documentState.settings.quietStart)}"></label>
+          <label class="field"><span class="field-label">End</span><input class="input" id="quiet-end" type="time" data-show-picker value="${escapeAttribute(documentState.settings.quietEnd)}"></label>
+        </div>
+        <div class="sheet-actions single"><button class="button primary full" type="button" data-action="save-quiet-hours">Save quiet hours</button></div>
+      </section>
+    </div>
+  `;
+  bindSheetDrag();
+}
+
+function saveQuietHours() {
+  if (currentSheet?.type !== "quiet-hours") return;
+  const start = sheetsRoot.querySelector("#quiet-start")?.value;
+  const end = sheetsRoot.querySelector("#quiet-end")?.value;
+  if (!isClockValue(start) || !isClockValue(end)) {
+    showToast("Choose a valid start and end time.");
+    return;
+  }
+  documentState.settings.quietStart = start;
+  documentState.settings.quietEnd = end;
+  scheduleSave();
+  closeSheet();
+  rerender();
+  showToast("Quiet hours saved");
+}
+
+function isClockValue(value) {
+  const match = /^(\d{2}):(\d{2})$/.exec(String(value));
+  return Boolean(match && Number(match[1]) < 24 && Number(match[2]) < 60);
+}
+
+function openAddSheet() {
+  currentSheet = {
+    type: "editor",
+    mode: "add",
+    taskId: null,
+    activeOption: null,
+    draft: createEditorDraft(),
+  };
+  document.body.classList.add("sheet-open");
+  renderEditorSheet({ autoFocus: true });
 }
 
 function openEditSheet(taskId) {
   const task = documentState.tasks.find((item) => item.id === taskId);
   if (!task) return;
-  currentSheet = { type: "edit", taskId };
+  currentSheet = {
+    type: "editor",
+    mode: "edit",
+    taskId,
+    activeOption: null,
+    draft: createEditorDraft(task),
+  };
   document.body.classList.add("sheet-open");
+  renderEditorSheet();
+}
+
+function createEditorDraft(task = null) {
+  const due = task?.due ? new Date(task.due) : null;
+  const draft = {
+    source: "",
+    title: task?.title || "",
+    notes: task?.notes || "",
+    due: task?.due ?? null,
+    allDay: Boolean(task?.allDay),
+    dateValue: due ? dateKey(due) : "",
+    timeValue: due && !task?.allDay ? timeInputValue(due) : "",
+    priority: task?.priority ?? 1,
+    color: task?.color ?? null,
+    tags: [...(task?.tags ?? [])],
+    reminder: task?.reminder ? { ...task.reminder } : null,
+    intervalMin: task?.reminder?.intervalMin ?? 30,
+    timer: task?.timer ? { ...task.timer } : null,
+    timerMin: task?.timer?.durationMin ?? 30,
+    breaks: task?.breaks ? { ...task.breaks } : null,
+    workMin: task?.breaks?.workMin ?? 25,
+    breakMin: task?.breaks?.breakMin ?? 5,
+    muteDuringSession: task?.muteDuringSession !== false,
+    clearedTypes: new Set(),
+    parsed: { parsed: [], title: task?.title || "" },
+  };
+  return draft;
+}
+
+function renderEditorSheet({ autoFocus = false } = {}) {
+  if (currentSheet?.type !== "editor") return;
+  const previousScroll = sheetsRoot.querySelector(".sheet")?.scrollTop || 0;
+  const { mode, taskId, draft, activeOption } = currentSheet;
+  const isAdd = mode === "add";
   sheetsRoot.innerHTML = `
     <div class="sheet-layer" role="presentation">
-      <button class="sheet-scrim" type="button" data-action="close-sheet" aria-label="Close task editor"></button>
-      <section class="sheet" role="dialog" aria-modal="true" aria-labelledby="edit-sheet-title">
+      <button class="sheet-scrim" type="button" data-action="close-sheet" aria-label="Close ${isAdd ? "add task" : "task editor"}"></button>
+      <section class="sheet editor-sheet" role="dialog" aria-modal="true" aria-labelledby="editor-sheet-title">
         <div class="sheet-grabber" aria-hidden="true"></div>
         <header class="sheet-header">
-          <h2 class="sheet-title" id="edit-sheet-title">Edit task</h2>
+          <h2 class="sheet-title" id="editor-sheet-title">${isAdd ? "Add task" : "Edit task"}</h2>
           <button class="sheet-close" type="button" data-action="close-sheet" aria-label="Close">×</button>
         </header>
-        <label class="field">
-          <span class="field-label">Title</span>
-          <input class="input" id="edit-task-title" type="text" value="${escapeAttribute(task.title)}">
-        </label>
-        <label class="field">
-          <span class="field-label">Notes</span>
-          <textarea class="textarea" id="edit-task-notes" placeholder="Anything useful…">${escapeHtml(task.notes || "")}</textarea>
-        </label>
-        <div class="option-toolbar" aria-label="Task options">
-          ${["Date", "Timing", "Priority", "Color", "Tags"].map((label) => `<button class="chip" type="button" data-action="placeholder">${label}</button>`).join("")}
-        </div>
-        <div class="sheet-actions">
-          <button class="button danger" type="button" data-action="delete-task" data-task-id="${task.id}">Delete</button>
-          <button class="button primary" type="button" data-action="save-edit" data-task-id="${task.id}">Save</button>
+        ${isAdd ? `
+          <label class="field">
+            <span class="field-label">What do you need to do?</span>
+            <input class="input quick-input" id="quick-task-input" data-field="source" type="text" autocomplete="off"
+              value="${escapeAttribute(draft.source)}" placeholder="Call Mom tomorrow 5pm #family">
+          </label>
+          <div class="chip-row parsed-preview" id="parsed-preview">${renderParsedChips(draft)}</div>
+          <p class="parse-hint">Try a day, time, interval, priority, or #tag. Interval timing is saved now; background delivery is not active until the notification round.</p>
+        ` : `
+          <label class="field">
+            <span class="field-label">Title</span>
+            <input class="input" id="edit-task-title" data-field="title" type="text" value="${escapeAttribute(draft.title)}">
+          </label>
+        `}
+        <div class="option-toolbar" aria-label="Task options">${renderOptionToolbar(draft, activeOption)}</div>
+        <div class="option-panel-wrap">${renderOptionPanel(activeOption, draft)}</div>
+        <div class="sheet-actions ${isAdd ? "single" : ""}">
+          ${isAdd ? "" : `<button class="button danger" type="button" data-action="delete-task" data-task-id="${taskId}">Delete</button>`}
+          <button class="button primary ${isAdd ? "full" : ""}" type="button" data-action="${isAdd ? "add-task" : "save-edit"}" ${isAdd ? "" : `data-task-id="${taskId}"`}>${isAdd ? "Add task" : "Save"}</button>
         </div>
       </section>
     </div>
   `;
+  bindSheetDrag();
+  requestAnimationFrame(() => {
+    const sheet = sheetsRoot.querySelector(".sheet");
+    if (sheet) sheet.scrollTop = previousScroll;
+    if (autoFocus) sheetsRoot.querySelector("#quick-task-input")?.focus({ preventScroll: true });
+  });
+}
+
+function renderOptionToolbar(draft, activeOption) {
+  return ["date", "timing", "priority", "color", "tags", "notes"].map((option) => {
+    const summary = optionSummary(option, draft);
+    const set = optionIsSet(option, draft);
+    return `
+      <button class="chip option-chip ${set ? "set" : ""} ${activeOption === option ? "open" : ""}" type="button"
+        data-action="task-option" data-option="${option}" data-touch-action="true" aria-expanded="${activeOption === option}">
+        ${optionIcon(option)}<span>${capitalize(option)}${summary ? `<small>${escapeHtml(summary)}</small>` : ""}</span>
+      </button>
+    `;
+  }).join("");
+}
+
+function optionIcon(option) {
+  const paths = {
+    date: '<rect x="4" y="5" width="16" height="15" rx="2"></rect><path d="M8 3v4M16 3v4M4 9h16"></path>',
+    timing: '<circle cx="12" cy="13" r="8"></circle><path d="M12 9v5l3 2M9 3h6"></path>',
+    priority: '<path d="M6 21V4M6 5h11l-2 4 2 4H6"></path>',
+    color: '<circle cx="12" cy="12" r="8"></circle><path d="M12 4a8 8 0 0 0 0 16c2 0 2-3 0-3h-1a2 2 0 0 1 0-4h5a4 4 0 0 0 4-4"></path>',
+    tags: '<path d="M4 5v6l8 8 7-7-8-8H5a1 1 0 0 0-1 1Z"></path><circle cx="8" cy="8" r="1"></circle>',
+    notes: '<path d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h5"></path>',
+  };
+  return `<svg class="chip-icon" viewBox="0 0 24 24" aria-hidden="true">${paths[option]}</svg>`;
+}
+
+function optionSummary(option, draft) {
+  if (option === "date" && draft.due) return formatDraftDue(draft);
+  if (option === "timing") {
+    const values = [];
+    if (draft.reminder) values.push(`every ${formatMinutes(draft.reminder.intervalMin)} · pending`);
+    if (draft.timer) values.push(`${formatMinutes(draft.timer.durationMin)} timer`);
+    if (draft.breaks) values.push(`${draft.breaks.workMin}/${draft.breaks.breakMin}`);
+    return values.join(" · ");
+  }
+  if (option === "priority" && draft.priority !== 1) return draft.priority === 2 ? "high" : "low";
+  if (option === "color" && draft.color) return "●";
+  if (option === "tags" && draft.tags.length) return `#${draft.tags[0]}${draft.tags.length > 1 ? ` +${draft.tags.length - 1}` : ""}`;
+  if (option === "notes" && draft.notes.trim()) return "●";
+  return "";
+}
+
+function optionIsSet(option, draft) {
+  return Boolean(optionSummary(option, draft));
+}
+
+function renderOptionPanel(option, draft) {
+  if (!option) return "";
+  if (option === "date") return `
+    <section class="option-panel" data-option-panel="date">
+      <div class="date-fields">
+        <label class="field"><span class="field-label">Date</span><input class="input" type="date" data-field="due-date" data-show-picker value="${draft.dateValue}"></label>
+        <label class="field"><span class="field-label">Time (optional)</span><input class="input" type="time" data-field="due-time" data-show-picker value="${draft.timeValue}"></label>
+      </div>
+      ${draft.due ? `<button class="button ghost compact-button" type="button" data-action="remove-parsed" data-type="due">Clear date</button>` : ""}
+    </section>`;
+  if (option === "timing") return renderTimingPanel(draft);
+  if (option === "priority") return `
+    <section class="option-panel" data-option-panel="priority">
+      <div class="segmented" role="group" aria-label="Priority">
+        ${[[0, "Low"], [1, "Normal"], [2, "High"]].map(([value, label]) => `<button class="segmented-option ${draft.priority === value ? "selected" : ""}" type="button" data-action="set-draft-priority" data-priority="${value}">${label}</button>`).join("")}
+      </div>
+    </section>`;
+  if (option === "color") return `
+    <section class="option-panel" data-option-panel="color">
+      <div class="color-picker" role="group" aria-label="Task color">
+        <button class="color-choice none ${!draft.color ? "selected" : ""}" type="button" data-action="set-draft-color" data-color="" aria-label="No color">×</button>
+        ${CATEGORY_COLORS.map((color) => `<button class="color-choice ${draft.color === color ? "selected" : ""}" type="button" data-action="set-draft-color" data-color="${color}" style="--swatch:${color}" aria-label="Choose ${color}"></button>`).join("")}
+      </div>
+    </section>`;
+  if (option === "tags") return `
+    <section class="option-panel" data-option-panel="tags">
+      <label class="field"><span class="field-label">Tags</span><input class="input" type="text" data-field="tags" value="${escapeAttribute(draft.tags.join(", "))}" placeholder="bills, family, errands"></label>
+      <p class="field-help">Separate tags with commas. The # is optional.</p>
+    </section>`;
+  return `
+    <section class="option-panel" data-option-panel="notes">
+      <label class="field"><span class="field-label">Notes</span><textarea class="textarea" data-field="notes" placeholder="Anything useful…">${escapeHtml(draft.notes)}</textarea></label>
+    </section>`;
+}
+
+function renderTimingPanel(draft) {
+  return `
+    <section class="option-panel" data-option-panel="timing">
+      ${renderTimingSwitch("Notify me every… (delivery next round)", "reminder-enabled", Boolean(draft.reminder), draft.reminder ? `
+        <label class="inline-duration"><span>Every</span><input class="input duration-input" type="number" inputmode="numeric" min="1" max="1440" data-field="interval-min" value="${draft.intervalMin}"><span>minutes</span></label>` : "")}
+      ${renderTimingSwitch("Task timer", "timer-enabled", Boolean(draft.timer), draft.timer ? `
+        <label class="inline-duration"><span>Duration</span><input class="input duration-input" type="number" inputmode="numeric" min="1" max="1440" data-field="timer-min" value="${draft.timerMin}"><span>minutes</span></label>` : "")}
+      ${renderTimingSwitch("Breaks", "breaks-enabled", Boolean(draft.breaks), draft.breaks ? `
+        <div class="duration-pair">
+          <label class="inline-duration"><span>Work</span><input class="input duration-input" type="number" inputmode="numeric" min="1" max="240" data-field="work-min" value="${draft.workMin}"><span>min</span></label>
+          <label class="inline-duration"><span>Break</span><input class="input duration-input" type="number" inputmode="numeric" min="1" max="120" data-field="break-min" value="${draft.breakMin}"><span>min</span></label>
+        </div>` : "")}
+      ${draft.timer || draft.breaks ? renderTimingSwitch("Silence intervals during a session", "mute-session", draft.muteDuringSession) : ""}
+      <p class="field-help timing-note">Minute entry is functional in this build. The scroll-wheel control ships with background notifications.</p>
+    </section>`;
+}
+
+function renderTimingSwitch(label, field, checked, details = "") {
+  return `<div class="timing-row">
+    <label class="switch-row"><span>${label}</span><input type="checkbox" role="switch" data-field="${field}" ${checked ? "checked" : ""}><span class="switch-track" aria-hidden="true"></span></label>
+    ${details}
+  </div>`;
+}
+
+function renderParsedChips(draft) {
+  let dueRendered = false;
+  return (draft.parsed?.parsed ?? []).filter((token) => {
+    if (!['date', 'time'].includes(token.type)) return true;
+    if (dueRendered) return false;
+    dueRendered = true;
+    return true;
+  }).map((token) => {
+    const type = ['date', 'time'].includes(token.type) ? 'due' : token.type;
+    return `
+    <button class="chip set parsed-chip" type="button" data-action="remove-parsed" data-type="${escapeAttribute(type)}" aria-label="Remove ${escapeAttribute(token.label)}">
+      ${escapeHtml(token.label)} <span aria-hidden="true">×</span>
+    </button>
+  `;
+  }).join("");
 }
 
 function closeSheet() {
@@ -573,28 +1007,29 @@ function closeSheet() {
 }
 
 function submitAddTask() {
-  const input = sheetsRoot.querySelector("#quick-task-input");
-  const source = input?.value.trim() || "";
+  if (currentSheet?.type !== "editor" || currentSheet.mode !== "add") return;
+  captureVisibleDraft();
+  const { draft } = currentSheet;
+  const source = draft.source.trim();
   if (!source) {
-    input?.focus();
+    sheetsRoot.querySelector("#quick-task-input")?.focus();
     showToast("Give the task a name first.");
     return;
   }
 
-  const parsed = parseQuickAdd(source);
   const now = Date.now();
   documentState = withAddedTask(documentState, {
-    title: parsed.title || source,
-    notes: "",
-    due: parsed.due,
-    allDay: parsed.allDay,
-    priority: parsed.priority ?? 1,
-    tags: parsed.tags,
-    color: null,
-    reminder: parsed.reminder,
-    timer: null,
-    breaks: null,
-    muteDuringSession: true,
+    title: draft.title.trim() || source,
+    notes: draft.notes,
+    due: draft.due,
+    allDay: draft.allDay,
+    priority: draft.priority,
+    tags: draft.tags,
+    color: draft.color,
+    reminder: draft.reminder,
+    timer: draft.timer,
+    breaks: draft.breaks,
+    muteDuringSession: draft.muteDuringSession,
     session: null,
     parentId: null,
     collapsed: false,
@@ -610,49 +1045,336 @@ function submitAddTask() {
 
 function saveTaskEdit(taskId) {
   const task = documentState.tasks.find((item) => item.id === taskId);
-  const title = sheetsRoot.querySelector("#edit-task-title")?.value.trim();
+  if (currentSheet?.type !== "editor") return;
+  captureVisibleDraft();
+  const { draft } = currentSheet;
+  const title = draft.title.trim();
   if (!task || !title) return;
   task.title = title;
-  task.notes = sheetsRoot.querySelector("#edit-task-notes")?.value.trim() || "";
+  task.notes = draft.notes.trim();
+  task.due = draft.due;
+  task.allDay = draft.allDay;
+  task.priority = draft.priority;
+  task.color = draft.color;
+  task.tags = [...draft.tags];
+  task.reminder = draft.reminder ? { ...draft.reminder } : null;
+  task.timer = draft.timer ? { ...draft.timer } : null;
+  task.breaks = draft.breaks ? { ...draft.breaks } : null;
+  task.muteDuringSession = draft.muteDuringSession;
+  if (!task.timer && !task.breaks) task.session = null;
   scheduleSave();
   closeSheet();
   rerender();
   showToast("Task saved");
 }
 
-function deleteTask(taskId) {
-  const descendants = new Set([taskId]);
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const task of documentState.tasks) {
-      if (task.parentId && descendants.has(task.parentId) && !descendants.has(task.id)) {
-        descendants.add(task.id);
-        changed = true;
-      }
+function handleSheetInput(target, eventType = "input") {
+  if (target?.dataset.filterSearch === "tags" && currentSheet?.type === "filter") {
+    currentSheet.query = target.value;
+    const tasks = documentState.tasks.filter((task) => !task.archived);
+    const tags = [...new Set([...inUseTags(tasks), ...activeFilters.tags])].sort((a, b) => a.localeCompare(b));
+    const choices = sheetsRoot.querySelector('[data-filter-choices="tags"]');
+    if (choices) {
+      choices.innerHTML = renderTagFilterChoices(searchTags(tags, currentSheet.query))
+        || '<p class="muted small">No matching tags.</p>';
     }
+    return;
   }
-  documentState.tasks = documentState.tasks.filter((task) => !descendants.has(task.id));
+  if (currentSheet?.type !== "editor" || !target?.dataset.field) return;
+  const { draft } = currentSheet;
+  const field = target.dataset.field;
+  let rerenderPanel = false;
+
+  if (field === "source") {
+    draft.source = target.value;
+    applyQuickSourceToDraft(draft);
+    refreshEditorChrome();
+    return;
+  }
+  if (field === "title") draft.title = target.value;
+  if (field === "notes") draft.notes = target.value;
+  if (field === "tags") {
+    draft.tags = normalizeTagInput(target.value);
+    draft.clearedTypes.add("tags");
+  }
+  if (field === "due-date" || field === "due-time") {
+    draft.dateValue = sheetsRoot.querySelector('[data-field="due-date"]')?.value || "";
+    draft.timeValue = sheetsRoot.querySelector('[data-field="due-time"]')?.value || "";
+    updateDraftDue(draft);
+    draft.clearedTypes.add("due");
+    if (eventType === "change" && target.matches(":focus")) target.blur();
+  }
+  if (field === "reminder-enabled") {
+    draft.reminder = target.checked ? { intervalMin: draft.intervalMin, startAt: null } : null;
+    draft.clearedTypes.add("reminder");
+    rerenderPanel = true;
+  }
+  if (field === "timer-enabled") {
+    draft.timer = target.checked ? { durationMin: draft.timerMin } : null;
+    rerenderPanel = true;
+  }
+  if (field === "breaks-enabled") {
+    draft.breaks = target.checked ? { workMin: draft.workMin, breakMin: draft.breakMin } : null;
+    rerenderPanel = true;
+  }
+  if (field === "mute-session") draft.muteDuringSession = target.checked;
+  if (field === "interval-min") {
+    draft.intervalMin = clampMinutes(target.value, 1, 1440, 30);
+    if (draft.reminder) draft.reminder.intervalMin = draft.intervalMin;
+    draft.clearedTypes.add("reminder");
+  }
+  if (field === "timer-min") {
+    draft.timerMin = clampMinutes(target.value, 1, 1440, 30);
+    if (draft.timer) draft.timer.durationMin = draft.timerMin;
+  }
+  if (field === "work-min") {
+    draft.workMin = clampMinutes(target.value, 1, 240, 25);
+    if (draft.breaks) draft.breaks.workMin = draft.workMin;
+  }
+  if (field === "break-min") {
+    draft.breakMin = clampMinutes(target.value, 1, 120, 5);
+    if (draft.breaks) draft.breaks.breakMin = draft.breakMin;
+  }
+
+  if (rerenderPanel) renderEditorSheet();
+  else refreshEditorToolbar();
+}
+
+function captureVisibleDraft() {
+  if (currentSheet?.type !== "editor") return;
+  const { draft } = currentSheet;
+  const source = sheetsRoot.querySelector('[data-field="source"]');
+  const title = sheetsRoot.querySelector('[data-field="title"]');
+  const notes = sheetsRoot.querySelector('[data-field="notes"]');
+  const tags = sheetsRoot.querySelector('[data-field="tags"]');
+  if (source) {
+    draft.source = source.value;
+    applyQuickSourceToDraft(draft);
+  }
+  if (title) draft.title = title.value;
+  if (notes) draft.notes = notes.value;
+  if (tags) draft.tags = normalizeTagInput(tags.value);
+}
+
+function applyQuickSourceToDraft(draft) {
+  const parsed = parseQuickAdd(draft.source, { clearedTypes: [...draft.clearedTypes] });
+  draft.parsed = parsed;
+  draft.title = parsed.title || draft.source.trim();
+  if (!draft.clearedTypes.has("due")) {
+    draft.due = parsed.due;
+    draft.allDay = parsed.allDay;
+    const due = parsed.due ? new Date(parsed.due) : null;
+    draft.dateValue = due ? dateKey(due) : "";
+    draft.timeValue = due && !parsed.allDay ? timeInputValue(due) : "";
+  }
+  if (!draft.clearedTypes.has("reminder")) {
+    draft.reminder = parsed.reminder ? { ...parsed.reminder } : null;
+    if (parsed.reminder) draft.intervalMin = parsed.reminder.intervalMin;
+  }
+  if (!draft.clearedTypes.has("priority")) draft.priority = parsed.priority ?? 1;
+  if (!draft.clearedTypes.has("tags")) draft.tags = [...parsed.tags];
+}
+
+function refreshEditorChrome() {
+  if (currentSheet?.type !== "editor") return;
+  const preview = sheetsRoot.querySelector("#parsed-preview");
+  if (preview) preview.innerHTML = renderParsedChips(currentSheet.draft);
+  refreshEditorToolbar();
+}
+
+function refreshEditorToolbar() {
+  if (currentSheet?.type !== "editor") return;
+  const toolbar = sheetsRoot.querySelector(".option-toolbar");
+  if (toolbar) toolbar.innerHTML = renderOptionToolbar(currentSheet.draft, currentSheet.activeOption);
+}
+
+function toggleTaskOption(option) {
+  if (currentSheet?.type !== "editor" || !["date", "timing", "priority", "color", "tags", "notes"].includes(option)) return;
+  captureVisibleDraft();
+  currentSheet.activeOption = currentSheet.activeOption === option ? null : option;
+  renderEditorSheet();
+}
+
+function removeParsedType(type) {
+  if (currentSheet?.type !== "editor") return;
+  const { draft } = currentSheet;
+  const normalized = type === "date" || type === "time" ? "due" : type;
+  draft.clearedTypes.add(normalized);
+  if (normalized === "due") {
+    draft.due = null;
+    draft.allDay = false;
+    draft.dateValue = "";
+    draft.timeValue = "";
+  } else if (normalized === "reminder") {
+    draft.reminder = null;
+  } else if (normalized === "priority") {
+    draft.priority = 1;
+  } else if (normalized === "tags") {
+    draft.tags = [];
+  }
+  if (currentSheet.mode === "add") applyQuickSourceToDraft(draft);
+  renderEditorSheet();
+}
+
+function setDraftPriority(priority) {
+  if (currentSheet?.type !== "editor" || ![0, 1, 2].includes(priority)) return;
+  currentSheet.draft.priority = priority;
+  currentSheet.draft.clearedTypes.add("priority");
+  renderEditorSheet();
+}
+
+function setDraftColor(color) {
+  if (currentSheet?.type !== "editor") return;
+  currentSheet.draft.color = CATEGORY_COLORS.includes(String(color).toLowerCase()) ? String(color).toLowerCase() : null;
+  renderEditorSheet();
+}
+
+function updateDraftDue(draft) {
+  if (!draft.dateValue && !draft.timeValue) {
+    draft.due = null;
+    draft.allDay = false;
+    return;
+  }
+  const day = draft.dateValue ? parseDateKey(draft.dateValue) : new Date();
+  if (Number.isNaN(day.getTime())) {
+    draft.due = null;
+    return;
+  }
+  if (draft.timeValue) {
+    const [hour, minute] = draft.timeValue.split(":").map(Number);
+    day.setHours(hour, minute, 0, 0);
+    draft.allDay = false;
+  } else {
+    day.setHours(23, 59, 59, 999);
+    draft.allDay = true;
+  }
+  draft.due = day.getTime();
+}
+
+function bindSheetDrag() {
+  const sheet = sheetsRoot.querySelector(".sheet");
+  if (!sheet) return;
+  let drag = null;
+  const controls = "input, textarea, select, button, a, label, [role='switch'], .chip, .segmented, .timing-row";
+  sheet.addEventListener("touchstart", (event) => {
+    if (event.touches.length !== 1 || event.target.closest(controls) || sheet.scrollTop > 0) return;
+    drag = { y: event.touches[0].clientY, delta: 0 };
+    sheet.classList.add("dragging-sheet");
+  }, { passive: true });
+  sheet.addEventListener("touchmove", (event) => {
+    if (!drag) return;
+    drag.delta = Math.max(0, event.touches[0].clientY - drag.y);
+    if (drag.delta > 4) event.preventDefault();
+    sheet.style.transform = `translateY(${Math.min(160, drag.delta)}px)`;
+  }, { passive: false });
+  sheet.addEventListener("touchend", () => {
+    if (!drag) return;
+    const shouldClose = drag.delta > 110;
+    drag = null;
+    sheet.classList.remove("dragging-sheet");
+    sheet.style.transform = "";
+    if (shouldClose) closeSheet();
+  }, { passive: true });
+  sheet.addEventListener("touchcancel", () => {
+    drag = null;
+    sheet.classList.remove("dragging-sheet");
+    sheet.style.transform = "";
+  }, { passive: true });
+}
+
+function normalizeTagInput(value) {
+  return [...new Set(String(value).split(",")
+    .map((tag) => tag.trim().replace(/^#+/, "").toLowerCase())
+    .filter(Boolean))];
+}
+
+function clampMinutes(value, min, max, fallback) {
+  const number = Math.round(Number(value));
+  return Number.isFinite(number) ? Math.min(max, Math.max(min, number)) : fallback;
+}
+
+function timeInputValue(date) {
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
+function formatDraftDue(draft) {
+  const date = new Date(draft.due);
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    ...(draft.allDay ? {} : { hour: "2-digit", minute: "2-digit" }),
+  }).format(date);
+}
+
+function formatMinutes(value) {
+  return value >= 60 && value % 60 === 0 ? `${value / 60}h` : `${value}m`;
+}
+
+function capitalize(value) {
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+function deleteTask(taskId, confirmed = false) {
+  const result = deleteTaskFromModel(documentState.tasks, taskId);
+  if (!result.deletedIds.length) return;
+  if (result.deletedIds.length > 1 && !confirmed) {
+    currentSheet = { type: "delete-confirm", taskId, count: result.deletedIds.length - 1 };
+    document.body.classList.add("sheet-open");
+    renderDeleteConfirmation();
+    return;
+  }
+  documentState.tasks = result.tasks;
   scheduleSave();
   closeSheet();
   rerender();
-  showToast(descendants.size > 1 ? `Deleted task and ${descendants.size - 1} subtasks` : "Task deleted");
+  showToast(result.deletedIds.length > 1 ? `Deleted task and ${result.deletedIds.length - 1} subtasks` : "Task deleted");
+}
+
+function renderDeleteConfirmation() {
+  if (currentSheet?.type !== "delete-confirm") return;
+  const { taskId, count } = currentSheet;
+  sheetsRoot.innerHTML = `
+    <div class="sheet-layer" role="presentation">
+      <button class="sheet-scrim" type="button" data-action="close-sheet" aria-label="Cancel delete"></button>
+      <section class="sheet confirm-sheet" role="alertdialog" aria-modal="true" aria-labelledby="delete-title">
+        <div class="sheet-grabber" aria-hidden="true"></div>
+        <header class="sheet-header">
+          <h2 class="sheet-title" id="delete-title">Delete this task?</h2>
+          <button class="sheet-close" type="button" data-action="close-sheet" aria-label="Close">×</button>
+        </header>
+        <p class="confirm-copy">This also deletes ${count} ${count === 1 ? "subtask" : "subtasks"}. This cannot be undone.</p>
+        <div class="sheet-actions">
+          <button class="button ghost" type="button" data-action="close-sheet">Cancel</button>
+          <button class="button danger" type="button" data-action="confirm-delete-task" data-task-id="${taskId}">Delete all</button>
+        </div>
+      </section>
+    </div>
+  `;
+  bindSheetDrag();
 }
 
 function toggleTask(taskId) {
-  const task = documentState.tasks.find((item) => item.id === taskId);
-  if (!task) return;
-  const wasDone = Boolean(task.completedAt);
-  task.completedAt = wasDone ? null : Date.now();
-  task.archived = !wasDone;
+  const result = completeWithDescendants(documentState.tasks, taskId, Date.now());
+  if (!result.previousStates.length) return;
+  documentState.tasks = result.completed ? setArchived(result.tasks, taskId, true) : result.tasks;
   scheduleSave();
   rerender();
-  showToast(wasDone ? "Moved back to open tasks" : "Done", wasDone ? null : () => {
-    task.completedAt = null;
-    task.archived = false;
+  const descendantCount = result.previousStates.length - 1;
+  showToast(result.completed ? `Done${descendantCount ? ` (+${descendantCount} subtasks)` : ""}` : "Moved back to open tasks", result.completed ? () => {
+    documentState.tasks = restoreTaskStates(documentState.tasks, result.previousStates);
     scheduleSave();
     rerender();
-  });
+  } : null);
+}
+
+function toggleSession(taskId) {
+  const task = documentState.tasks.find((item) => item.id === taskId);
+  if (!task || task.completedAt || task.archived || (!task.timer && !task.breaks)) return;
+  const stopping = Boolean(task.session);
+  task.session = stopping ? null : { startedAt: Date.now() };
+  scheduleSave();
+  rerender();
+  showToast(stopping ? "Focus session stopped" : "Focus session started");
 }
 
 function selectTheme(themeId) {
@@ -664,16 +1386,81 @@ function selectTheme(themeId) {
   rerender();
 }
 
-function updateParsedPreview(source) {
-  const preview = sheetsRoot.querySelector("#parsed-preview");
-  if (!preview) return;
-  const parsed = parseQuickAdd(source);
-  const chips = [];
-  if (parsed.due) chips.push(new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", ...(parsed.allDay ? {} : { hour: "numeric", minute: "2-digit" }) }).format(parsed.due));
-  if (parsed.reminder) chips.push(`every ${parsed.reminder.intervalMin >= 60 && parsed.reminder.intervalMin % 60 === 0 ? `${parsed.reminder.intervalMin / 60}h` : `${parsed.reminder.intervalMin}m`}`);
-  if (parsed.priority === 2) chips.push("high priority");
-  for (const tag of parsed.tags) chips.push(`#${tag}`);
-  preview.innerHTML = chips.map((label) => `<span class="chip set">${escapeHtml(label)}</span>`).join("");
+async function exportBackup() {
+  const contents = serializeData(documentState);
+  const filename = `taskfocus-backup-${dateKey(new Date())}.json`;
+  const file = new File([contents], filename, { type: "application/json" });
+  try {
+    if (navigator.share && navigator.canShare?.({ files: [file] })) {
+      await navigator.share({ title: "TaskFocus backup", files: [file] });
+      showToast("Backup ready to save or share");
+      return;
+    }
+  } catch (error) {
+    if (error?.name === "AbortError") return;
+  }
+  const url = URL.createObjectURL(file);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1_000);
+  showToast("Backup downloaded");
+}
+
+function chooseImportBackup() {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = ".json,application/json";
+  input.addEventListener("change", async () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+      const imported = prepareImportedData(await file.text());
+      currentSheet = { type: "import-confirm", imported };
+      document.body.classList.add("sheet-open");
+      renderImportConfirmation();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "That backup could not be read.");
+    }
+  }, { once: true });
+  input.click();
+}
+
+function renderImportConfirmation() {
+  if (currentSheet?.type !== "import-confirm") return;
+  const count = currentSheet.imported.tasks.length;
+  sheetsRoot.innerHTML = `
+    <div class="sheet-layer" role="presentation">
+      <button class="sheet-scrim" type="button" data-action="close-sheet" aria-label="Cancel import"></button>
+      <section class="sheet confirm-sheet" role="alertdialog" aria-modal="true" aria-labelledby="import-title">
+        <div class="sheet-grabber" aria-hidden="true"></div>
+        <header class="sheet-header">
+          <h2 class="sheet-title" id="import-title">Replace everything?</h2>
+          <button class="sheet-close" type="button" data-action="close-sheet" aria-label="Close">×</button>
+        </header>
+        <p class="confirm-copy">Replace everything with this backup (${count} ${count === 1 ? "task" : "tasks"})? Your current data remains in the automatic safety backup until the next change.</p>
+        <div class="sheet-actions">
+          <button class="button ghost" type="button" data-action="close-sheet">Cancel</button>
+          <button class="button danger" type="button" data-action="confirm-import">Replace everything</button>
+        </div>
+      </section>
+    </div>
+  `;
+  bindSheetDrag();
+}
+
+function confirmImport() {
+  if (currentSheet?.type !== "import-confirm") return;
+  const imported = currentSheet.imported;
+  if (!persistDocumentNow(imported, { backupDocument: documentState })) return;
+  documentState = imported;
+  activeFilters = { colors: [], tags: [] };
+  selectedThemeFamily = themes[documentState.settings.theme]?.family || "ember";
+  applyTheme(documentState.settings.theme);
+  closeSheet();
+  rerender({ entry: true });
+  showToast("Backup restored");
 }
 
 function showToast(message, undo = null) {
@@ -763,6 +1550,11 @@ function dateKey(date) {
 function parseDateKey(key) {
   const [year, month, day] = key.split("-").map(Number);
   return new Date(year, month - 1, day);
+}
+
+function parentTitle(task) {
+  if (!task?.parentId) return "";
+  return documentState.tasks.find((candidate) => candidate.id === task.parentId)?.title || "";
 }
 
 function safeColor(value) {

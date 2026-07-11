@@ -4,6 +4,10 @@ function capacitorRuntime() {
 
 export const isNative = Boolean(capacitorRuntime()?.isNativePlatform?.());
 
+export function nativePlugin(name) {
+  return isNative ? capacitorRuntime()?.Plugins?.[name] || null : null;
+}
+
 export function platformName() {
   if (isNative) {
     const platform = capacitorRuntime()?.getPlatform?.();

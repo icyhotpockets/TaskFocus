@@ -2,10 +2,10 @@
 
 ## Current delivery status
 
-- **Released:** Phase 1 delivery foundation.
-- **In the next verified build:** full task option chips, removable quick-add chips, Category/Tags filter sheets, backup/restore, quiet-hours editing, and start/stop focus sessions.
+- **Released through Build 7:** delivery foundation, data/task CRUD, functional task-option and filter chips, backup/restore, quiet hours, and basic focus sessions.
+- **In the next verified build:** Android interval reminders, exact due alerts, alarm reconciliation, notification permission/settings, a two-minute delivery test, and Done/Snooze actions.
 - **Next build after that:** Phase 3 hierarchy, gestures, completion cascade/animation, and Clear all.
-- **Not delivered yet:** native alarm scheduling/actions and the iPhone Web Push backend.
+- **Not delivered yet:** the iPhone Web Push backend and the remaining hierarchy/gesture polish.
 
 The Settings screen also carries a short build-status card so phone testers can see which layer is present in the APK they are using.
 

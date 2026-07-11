@@ -631,6 +631,22 @@ svg {
   border-top: 0;
 }
 
+.stacked-setting-row {
+  padding: 8px 0;
+}
+
+.guidance-row {
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+  color: var(--text-faint);
+  font-size: 0.72rem;
+  line-height: 1.45;
+}
+
+.error-copy {
+  color: var(--danger);
+}
+
 .setting-label {
   min-width: 0;
 }

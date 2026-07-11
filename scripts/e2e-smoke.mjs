@@ -58,6 +58,139 @@ async function importBackupFile(page, contents, name = 'taskfocus-backup.json') 
   });
 }
 
+async function runNativeNotificationSmoke(browser, origin) {
+  const context = await browser.newContext({
+    viewport: { width: 412, height: 915 },
+    screen: { width: 412, height: 915 },
+    hasTouch: true,
+    isMobile: true,
+    serviceWorkers: 'block',
+  });
+  await context.addInitScript(() => {
+    const state = {
+      permission: 'prompt',
+      exact: 'prompt',
+      pending: [],
+      registeredActionTypes: null,
+      channel: null,
+      actionListener: null,
+      resumeListener: null,
+    };
+    globalThis.__nativeNotifications = state;
+    globalThis.Capacitor = {
+      isNativePlatform: () => true,
+      getPlatform: () => 'android',
+      Plugins: {
+        LocalNotifications: {
+          registerActionTypes: async (options) => { state.registeredActionTypes = options; },
+          createChannel: async (options) => { state.channel = options; },
+          checkPermissions: async () => ({ display: state.permission }),
+          requestPermissions: async () => ({ display: (state.permission = 'granted') }),
+          checkExactNotificationSetting: async () => ({ exact_alarm: state.exact }),
+          changeExactNotificationSetting: async () => ({ exact_alarm: (state.exact = 'granted') }),
+          getPending: async () => ({ notifications: state.pending }),
+          cancel: async ({ notifications }) => {
+            const ids = new Set(notifications.map(({ id }) => id));
+            state.pending = state.pending.filter(({ id }) => !ids.has(id));
+          },
+          schedule: async ({ notifications }) => {
+            const ids = new Set(notifications.map(({ id }) => id));
+            state.pending = [
+              ...state.pending.filter(({ id }) => !ids.has(id)),
+              ...notifications,
+            ];
+            return { notifications: notifications.map(({ id }) => ({ id })) };
+          },
+          addListener: async (name, listener) => {
+            if (name === 'localNotificationActionPerformed') state.actionListener = listener;
+            return { remove: async () => undefined };
+          },
+        },
+        App: {
+          addListener: async (name, listener) => {
+            if (name === 'resume') state.resumeListener = listener;
+            return { remove: async () => undefined };
+          },
+        },
+      },
+    };
+  });
+
+  const page = await context.newPage();
+  const failures = [];
+  page.on('console', (message) => {
+    if (message.type() === 'error') failures.push(`native console: ${message.text()}`);
+  });
+  page.on('pageerror', (error) => failures.push(`native pageerror: ${error.message}`));
+
+  await page.goto(`${origin}/index.html#settings`, { waitUntil: 'networkidle' });
+  await page.locator('[data-action="enable-notifications"]').tap();
+  await page.getByRole('button', { name: 'Enabled', exact: true }).waitFor();
+  await page.locator('[data-action="exact-notifications"]').tap();
+  await page.getByRole('button', { name: 'Allowed', exact: true }).waitFor();
+
+  const bridgeSetup = await page.evaluate(() => ({
+    channel: globalThis.__nativeNotifications.channel,
+    registeredActionTypes: globalThis.__nativeNotifications.registeredActionTypes,
+    hasActionListener: typeof globalThis.__nativeNotifications.actionListener === 'function',
+    hasResumeListener: typeof globalThis.__nativeNotifications.resumeListener === 'function',
+  }));
+  assert.equal(bridgeSetup.channel.importance, 5);
+  assert.equal(bridgeSetup.registeredActionTypes.types.length, 2);
+  assert.equal(bridgeSetup.hasActionListener, true);
+  assert.equal(bridgeSetup.hasResumeListener, true);
+
+  await page.locator('#fab').tap();
+  await page.locator('#quick-task-input').fill('Native reminder tomorrow 5pm every 30m');
+  await page.locator('[data-action="add-task"]').tap();
+  await page.getByText('Native reminder', { exact: true }).first().waitFor();
+  await page.waitForFunction(() => globalThis.__nativeNotifications.pending.some(({ id }) => id !== 999001));
+
+  const taskId = await page.evaluate(() => {
+    const data = JSON.parse(localStorage.getItem('taskfocus.data.v1'));
+    return data.tasks.find(({ title }) => title === 'Native reminder').id;
+  });
+  assert.ok(taskId > 0);
+
+  await page.locator('[data-route="settings"]').tap();
+  await page.locator('[data-action="test-notification"]').tap();
+  await page.waitForFunction(() => globalThis.__nativeNotifications.pending.some(({ id }) => id === 999001));
+
+  const snoozeStartedAt = Date.now();
+  await page.evaluate(async (id) => {
+    await globalThis.__nativeNotifications.actionListener({
+      actionId: 'snooze',
+      notification: { id: id * 100, extra: { taskId: id } },
+    });
+  }, taskId);
+  const snoozedStartAt = await page.evaluate((id) => {
+    const data = JSON.parse(localStorage.getItem('taskfocus.data.v1'));
+    return data.tasks.find(({ id: candidateId }) => candidateId === id).reminder.startAt;
+  }, taskId);
+  assert.ok(snoozedStartAt >= snoozeStartedAt + 59 * 60_000, 'Snooze should move the reminder about one hour');
+
+  await page.evaluate(async (id) => {
+    await globalThis.__nativeNotifications.actionListener({
+      actionId: 'done',
+      notification: { id: id * 100, extra: { taskId: id } },
+    });
+  }, taskId);
+  const completed = await page.evaluate((id) => {
+    const data = JSON.parse(localStorage.getItem('taskfocus.data.v1'));
+    return data.tasks.find(({ id: candidateId }) => candidateId === id);
+  }, taskId);
+  assert.ok(completed.completedAt);
+  assert.equal(completed.archived, true);
+  assert.deepEqual(
+    await page.evaluate(() => globalThis.__nativeNotifications.pending.map(({ id }) => id)),
+    [999001],
+    'Completing from the notification should cancel the task alarms while preserving the test alert',
+  );
+
+  assert.deepEqual(failures, [], failures.join('\n'));
+  await context.close();
+}
+
 try {
   browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
@@ -394,6 +527,7 @@ try {
 
   assert.deepEqual(failures, [], failures.join('\n'));
   await context.close();
+  await runNativeNotificationSmoke(browser, origin);
 } finally {
   await browser?.close();
   await new Promise((resolveClose, reject) => {

@@ -23,7 +23,16 @@ import {
   restoreTaskStates,
   setArchived,
 } from "./core/model.js";
-import { expireFinishedSessions, sessionState } from "./core/notifications.js";
+import { expireFinishedSessions, planIntervalNags, sessionState } from "./core/notifications.js";
+import {
+  configureNativeNotifications,
+  getNativeNotificationStatus,
+  openExactAlarmSettings,
+  reconcileNativeNotifications,
+  requestNativeNotificationPermission,
+  scheduleNativeTestNotification,
+  taskIdFromNotificationAction,
+} from "./notifications.js";
 import { parseQuickAdd } from "./core/parser.js";
 import { CATEGORY_COLORS } from "./core/themes.js";
 import { checkForNativeUpdate } from "./update.js";
@@ -53,6 +62,14 @@ let selectedCalendarDate = dateKey(new Date());
 let buildLabel = "development";
 let buildVersionName = "development";
 let activeFilters = { colors: [], tags: [] };
+let notificationUi = {
+  supported: isNative,
+  permission: isNative ? "prompt" : "unavailable",
+  exact: isNative ? "prompt" : "unavailable",
+  pending: 0,
+  error: "",
+};
+let notificationReconcileTimer = null;
 const routeScroll = new Map();
 let touchAction = null;
 
@@ -63,6 +80,7 @@ rerender({ entry: true });
 loadBuildVersion({ reloadOnChange: !isNative });
 registerServiceWorker();
 checkForUpdates();
+initializeNotificationRuntime();
 
 setInterval(() => {
   if (!currentSheet && document.visibilityState === "visible") {
@@ -108,6 +126,7 @@ function loadDocument() {
 function scheduleSave() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => persistDocumentNow(), 250);
+  queueNotificationReconcile();
 }
 
 function persistDocumentNow(nextDocument = documentState, { backupDocument = null } = {}) {
@@ -261,6 +280,12 @@ function handleAction(actionTarget, event) {
     openQuietHoursSheet();
   } else if (action === "save-quiet-hours") {
     saveQuietHours();
+  } else if (action === "enable-notifications") {
+    enableNotifications();
+  } else if (action === "exact-notifications") {
+    requestExactNotifications();
+  } else if (action === "test-notification") {
+    testNotification();
   }
 }
 
@@ -407,9 +432,7 @@ function renderTaskCard(task, index = 0, { parentLabel = "" } = {}) {
       ? `<span class="chip">⏱ ${task.timer.durationMin}m</span>`
       : "";
   const priority = task.priority === 2 ? `<span class="chip priority-high">high</span>` : "";
-  const reminder = task.reminder
-    ? `<span class="chip pending">every ${formatMinutes(task.reminder.intervalMin)} · delivery pending</span>`
-    : "";
+  const reminder = task.reminder ? reminderChip(task) : "";
   const category = task.color
     ? `<span class="chip"><span class="chip-dot" style="--chip-color:${safeColor(task.color)}"></span> category</span>`
     : "";
@@ -472,6 +495,23 @@ function sessionTimeLabel(task) {
   const state = sessionState(task, Date.now());
   const phase = state.phase === "break" ? "break · " : "";
   return `${phase}${Math.max(0, Math.ceil(state.remainingMs / 60_000))}m left`;
+}
+
+function reminderChip(task) {
+  const interval = `every ${formatMinutes(task.reminder.intervalMin)}`;
+  if (!isNative) return `<span class="chip pending">${interval} · iPhone push pending</span>`;
+  if (notificationUi.permission !== "granted") {
+    return `<span class="chip pending">${interval} · permission needed</span>`;
+  }
+  const [next] = planIntervalNags([task], documentState.settings, Date.now(), {
+    windowHours: 24,
+    perTaskLimit: 1,
+    totalLimit: 1,
+  });
+  const nextLabel = next
+    ? `next in ${Math.max(1, Math.ceil((next.fireAt - Date.now()) / 60_000))}m`
+    : "waiting for quiet hours";
+  return `<span class="chip progress">${interval} · ${nextLabel}</span>`;
 }
 
 function renderCalendarView() {
@@ -541,6 +581,14 @@ function renderCalendarView() {
 function renderSettingsView() {
   const currentTheme = themes[documentState.settings.theme] || themes.ember;
   const family = themeFamilies[selectedThemeFamily];
+  const permissionCopy = notificationUi.permission === "granted"
+    ? `${notificationUi.pending} alarms currently scheduled`
+    : notificationUi.permission === "denied"
+      ? "Blocked in Android notification settings"
+      : isNative ? "Tap Enable to allow reminders" : "iPhone push connection comes after Android delivery";
+  const exactCopy = notificationUi.exact === "granted"
+    ? "Exact alarms allowed"
+    : "Approval needed for on-time delivery";
   const themeButtons = themesForFamily(selectedThemeFamily).map((theme) => `
     <button
       class="theme-option ${theme.id === currentTheme.id ? "selected" : ""}"
@@ -569,13 +617,35 @@ function renderSettingsView() {
             <span class="platform-pill">${escapeHtml(platformName())}</span>
           </div>
           <div class="setting-row">
-            <div class="setting-label"><strong>Permission</strong><span>Delivery setup comes in the notification build</span></div>
-            <button class="button" type="button" disabled>Next round</button>
+            <div class="setting-label"><strong>Permission</strong><span>${escapeHtml(permissionCopy)}</span></div>
+            ${isNative ? `
+              <button class="button" type="button" data-action="enable-notifications" ${notificationUi.permission === "granted" ? "disabled" : ""}>
+                ${notificationUi.permission === "granted" ? "Enabled" : "Enable"}
+              </button>
+            ` : `<button class="button" type="button" disabled>iPhone next</button>`}
           </div>
+          ${isNative ? `
+            <div class="setting-row">
+              <div class="setting-label"><strong>Exact alarms</strong><span>${escapeHtml(exactCopy)}</span></div>
+              <button class="button ghost" type="button" data-action="exact-notifications" ${notificationUi.exact === "granted" ? "disabled" : ""}>
+                ${notificationUi.exact === "granted" ? "Allowed" : "Review"}
+              </button>
+            </div>
+          ` : ""}
           <div class="setting-row">
             <div class="setting-label"><strong>Quiet hours</strong><span>${documentState.settings.quietStart}–${documentState.settings.quietEnd}</span></div>
             <button class="button ghost" type="button" data-action="open-quiet-hours">Edit</button>
           </div>
+          ${isNative ? `
+            <div class="setting-row stacked-setting-row">
+              <div class="setting-label"><strong>Test delivery</strong><span>Schedules one notification exactly 2 minutes from now</span></div>
+              <button class="button" type="button" data-action="test-notification" ${notificationUi.permission === "granted" ? "" : "disabled"}>Test</button>
+            </div>
+            <div class="guidance-row">For reliable reminders: Android Settings → Apps → TaskFocus → Battery → Unrestricted.</div>
+          ` : `
+            <div class="guidance-row">iPhone background reminders require Add to Home Screen and the upcoming push connection.</div>
+          `}
+          ${notificationUi.error ? `<div class="guidance-row error-copy">${escapeHtml(notificationUi.error)}</div>` : ""}
         </section>
 
         <section class="settings-card" style="--i:1">
@@ -623,7 +693,8 @@ function renderSettingsView() {
           <div class="build-status-list">
             <div class="build-status-row"><span>Task editor, filters, backup, basic focus timer</span><span class="status-pill ready">Ready</span></div>
             <div class="build-status-row"><span>Subtasks, gestures, completion animation</span><span class="status-pill next">Next</span></div>
-            <div class="build-status-row"><span>Background reminders and iPhone push</span><span class="status-pill planned">Planned</span></div>
+            <div class="build-status-row"><span>Android reminders and notification actions</span><span class="status-pill ${isNative ? "ready" : "next"}">${isNative ? "Ready" : "Android"}</span></div>
+            <div class="build-status-row"><span>iPhone background push</span><span class="status-pill planned">Planned</span></div>
           </div>
         </section>
 
@@ -856,7 +927,7 @@ function renderEditorSheet({ autoFocus = false } = {}) {
               value="${escapeAttribute(draft.source)}" placeholder="Call Mom tomorrow 5pm #family">
           </label>
           <div class="chip-row parsed-preview" id="parsed-preview">${renderParsedChips(draft)}</div>
-          <p class="parse-hint">Try a day, time, interval, priority, or #tag. Interval timing is saved now; background delivery is not active until the notification round.</p>
+          <p class="parse-hint">Try a day, time, interval, priority, or #tag. ${isNative ? "Android schedules interval reminders after notification permission is enabled." : "iPhone interval delivery needs the upcoming push connection."}</p>
         ` : `
           <label class="field">
             <span class="field-label">Title</span>
@@ -961,9 +1032,13 @@ function renderOptionPanel(option, draft) {
 }
 
 function renderTimingPanel(draft) {
+  const intervalLabel = isNative ? "Notify me every…" : "Notify me every… (iPhone push setup pending)";
+  const timingNote = isNative
+    ? "Minute entry is functional. Android reminders schedule after notification permission is enabled."
+    : "Minute entry is functional. iPhone background delivery needs the upcoming push connection.";
   return `
     <section class="option-panel" data-option-panel="timing">
-      ${renderTimingSwitch("Notify me every… (delivery next round)", "reminder-enabled", Boolean(draft.reminder), draft.reminder ? `
+      ${renderTimingSwitch(intervalLabel, "reminder-enabled", Boolean(draft.reminder), draft.reminder ? `
         <label class="inline-duration"><span>Every</span><input class="input duration-input" type="number" inputmode="numeric" min="1" max="1440" data-field="interval-min" value="${draft.intervalMin}"><span>minutes</span></label>` : "")}
       ${renderTimingSwitch("Task timer", "timer-enabled", Boolean(draft.timer), draft.timer ? `
         <label class="inline-duration"><span>Duration</span><input class="input duration-input" type="number" inputmode="numeric" min="1" max="1440" data-field="timer-min" value="${draft.timerMin}"><span>minutes</span></label>` : "")}
@@ -973,7 +1048,7 @@ function renderTimingPanel(draft) {
           <label class="inline-duration"><span>Break</span><input class="input duration-input" type="number" inputmode="numeric" min="1" max="120" data-field="break-min" value="${draft.breakMin}"><span>min</span></label>
         </div>` : "")}
       ${draft.timer || draft.breaks ? renderTimingSwitch("Silence intervals during a session", "mute-session", draft.muteDuringSession) : ""}
-      <p class="field-help timing-note">Minute entry is functional in this build. The scroll-wheel control ships with background notifications.</p>
+      <p class="field-help timing-note">${escapeHtml(timingNote)}</p>
     </section>`;
 }
 
@@ -1459,9 +1534,138 @@ function confirmImport() {
   activeFilters = { colors: [], tags: [] };
   selectedThemeFamily = themes[documentState.settings.theme]?.family || "ember";
   applyTheme(documentState.settings.theme);
+  queueNotificationReconcile();
   closeSheet();
   rerender({ entry: true });
   showToast("Backup restored");
+}
+
+async function initializeNotificationRuntime() {
+  if (!isNative) return;
+  try {
+    await configureNativeNotifications({
+      onAction: handleNativeNotificationAction,
+      onResume: handleNativeResume,
+    });
+    await refreshNotificationUi({ render: false });
+    if (notificationUi.permission === "granted") await reconcileNotificationsNow({ render: false });
+    if (currentRoute === "settings" && !currentSheet) rerender();
+  } catch (error) {
+    notificationUi.error = error instanceof Error ? error.message : "Android notification setup failed.";
+    if (currentRoute === "settings" && !currentSheet) rerender();
+  }
+}
+
+function queueNotificationReconcile() {
+  if (!isNative) return;
+  clearTimeout(notificationReconcileTimer);
+  notificationReconcileTimer = setTimeout(() => reconcileNotificationsNow(), 400);
+}
+
+async function refreshNotificationUi({ render = true } = {}) {
+  if (!isNative) return notificationUi;
+  try {
+    notificationUi = { ...await getNativeNotificationStatus(), error: "" };
+  } catch (error) {
+    notificationUi.error = error instanceof Error ? error.message : "Could not read notification status.";
+  }
+  if (render && currentRoute === "settings" && !currentSheet) rerender();
+  return notificationUi;
+}
+
+async function reconcileNotificationsNow({ render = true } = {}) {
+  if (!isNative) return;
+  clearTimeout(notificationReconcileTimer);
+  try {
+    await reconcileNativeNotifications(documentState);
+    await refreshNotificationUi({ render });
+  } catch (error) {
+    notificationUi.error = error instanceof Error ? error.message : "Could not schedule reminders.";
+    if (render && currentRoute === "settings" && !currentSheet) rerender();
+  }
+}
+
+async function enableNotifications() {
+  if (!isNative) return;
+  try {
+    const permission = await requestNativeNotificationPermission();
+    if (permission !== "granted") {
+      notificationUi.permission = permission;
+      showToast("Android notification permission was not granted.");
+      await refreshNotificationUi();
+      return;
+    }
+    await reconcileNotificationsNow();
+    showToast("Android reminders enabled");
+  } catch (error) {
+    notificationUi.error = error instanceof Error ? error.message : "Could not enable notifications.";
+    rerender();
+  }
+}
+
+async function requestExactNotifications() {
+  if (!isNative) return;
+  try {
+    await openExactAlarmSettings();
+    await refreshNotificationUi();
+  } catch (error) {
+    notificationUi.error = error instanceof Error ? error.message : "Could not open exact-alarm settings.";
+    rerender();
+  }
+}
+
+async function testNotification() {
+  if (!isNative || notificationUi.permission !== "granted") {
+    showToast("Enable Android notifications first.");
+    return;
+  }
+  try {
+    await scheduleNativeTestNotification();
+    await refreshNotificationUi();
+    showToast("Test scheduled for 2 minutes. Close TaskFocus and watch the lock screen.");
+  } catch (error) {
+    notificationUi.error = error instanceof Error ? error.message : "Could not schedule the test notification.";
+    rerender();
+  }
+}
+
+async function handleNativeResume() {
+  reconcileFinishedSessions();
+  await refreshNotificationUi({ render: false });
+  if (notificationUi.permission === "granted") await reconcileNotificationsNow({ render: false });
+  if (!currentSheet) rerender();
+}
+
+async function handleNativeNotificationAction(action) {
+  const taskId = taskIdFromNotificationAction(action);
+  if (action?.actionId === "tap") {
+    if (currentRoute !== "tasks") location.hash = "#tasks";
+    else rerender();
+    return;
+  }
+  if (!taskId) return;
+  const task = documentState.tasks.find((candidate) => candidate.id === taskId);
+  if (!task) return;
+
+  if (action.actionId === "done") {
+    if (task.completedAt || task.archived) {
+      await reconcileNotificationsNow({ render: false });
+      return;
+    }
+    const result = completeWithDescendants(documentState.tasks, taskId, Date.now());
+    documentState.tasks = result.completed ? setArchived(result.tasks, taskId, true) : result.tasks;
+    persistDocumentNow();
+    await reconcileNotificationsNow({ render: false });
+    if (currentRoute !== "tasks") location.hash = "#tasks";
+    else rerender();
+    showToast("Task completed from notification");
+  } else if (action.actionId === "snooze" && task.reminder) {
+    task.reminder.startAt = Date.now() + 60 * 60_000;
+    persistDocumentNow();
+    await reconcileNotificationsNow({ render: false });
+    if (!currentSheet) rerender();
+    showToast("Reminder snoozed for 1 hour");
+  }
 }
 
 function showToast(message, undo = null) {

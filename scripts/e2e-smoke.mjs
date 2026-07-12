@@ -58,6 +58,16 @@ async function importBackupFile(page, contents, name = 'taskfocus-backup.json') 
   });
 }
 
+async function swipeCard(page, title, fromX, toX) {
+  const card = page.locator('.task-card').filter({ hasText: title }).first();
+  await card.evaluate((element, points) => {
+    const touch = (x) => new Touch({ identifier: 1, target: element, clientX: x, clientY: 120 });
+    element.dispatchEvent(new TouchEvent('touchstart', { bubbles: true, cancelable: true, touches: [touch(points.fromX)] }));
+    element.dispatchEvent(new TouchEvent('touchmove', { bubbles: true, cancelable: true, touches: [touch(points.toX)] }));
+    element.dispatchEvent(new TouchEvent('touchend', { bubbles: true, cancelable: true, touches: [], changedTouches: [touch(points.toX)] }));
+  }, { fromX, toX });
+}
+
 async function runNativeNotificationSmoke(browser, origin) {
   const context = await browser.newContext({
     viewport: { width: 412, height: 915 },
@@ -385,7 +395,31 @@ try {
   assert.equal(configured.due, null);
   assert.equal(configured.allDay, false);
 
-  // Timer-equipped tasks start and stop a focus session; completed cards never offer Play.
+  // One focused hierarchy/gesture sanity path covers add, tree collapse, swipe delete, cascade, Undo, and Clear all.
+  await page.getByText('Configured task', { exact: true }).first().tap();
+  editor = page.locator('#sheets [role="dialog"]');
+  await editor.locator('[data-action="add-subtask"]').tap();
+  await page.locator('#quick-task-input').fill('Nested step one');
+  await page.locator('[data-action="add-task"]').tap();
+  await page.getByText('Nested step one', { exact: true }).first().waitFor();
+
+  await swipeCard(page, 'Configured task', 70, 180);
+  await page.getByRole('heading', { name: 'Add subtask' }).waitFor();
+  await page.locator('#quick-task-input').fill('Nested step two');
+  await page.locator('[data-action="add-task"]').tap();
+  await page.getByText('Nested step two', { exact: true }).first().waitFor();
+  let configuredTree = page.locator('.task-tree-node').filter({ has: page.getByText('Configured task', { exact: true }) }).first();
+  await configuredTree.getByText('0/2', { exact: true }).waitFor();
+  await configuredTree.locator('[data-action="toggle-collapse"]').tap();
+  await page.waitForFunction(() => document.querySelector('.task-tree-node.is-collapsed [data-action="toggle-collapse"]'));
+  await configuredTree.locator('[data-action="toggle-collapse"]').tap();
+
+  await swipeCard(page, 'Nested step one', 190, 90);
+  const nestedOneWrap = page.locator('.task-card-wrap').filter({ hasText: 'Nested step one' }).first();
+  await nestedOneWrap.locator('[data-action="delete-task"]').tap();
+  await page.getByText('Nested step one', { exact: true }).waitFor({ state: 'detached' });
+
+  // Timer-equipped tasks start and stop a focus session; cascade completion archives the remaining subtree.
   let configuredCard = page.locator('.task-card').filter({ hasText: 'Configured task' }).first();
   await configuredCard.getByRole('button', { name: 'Start focus session' }).tap();
   await configuredCard.getByRole('button', { name: 'Stop focus session' }).waitFor();
@@ -402,6 +436,15 @@ try {
     0,
     'Completed tasks must not show a focus-session control',
   );
+  await doneDetails.getByText('Nested step two', { exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Undo', exact: true }).tap();
+  configuredCard = page.locator('.task-card').filter({ hasText: 'Configured task' }).first();
+  await configuredCard.getByRole('button', { name: 'Complete Configured task' }).waitFor();
+  await configuredCard.getByRole('button', { name: 'Complete Configured task' }).tap();
+  await doneDetails.locator('summary').tap();
+  await doneDetails.locator('[data-action="clear-done"]').tap();
+  await page.getByRole('alertdialog').locator('[data-action="confirm-clear-done"]').tap();
+  await page.getByText('Configured task', { exact: true }).waitFor({ state: 'detached' });
 
   await page.locator('[data-route="calendar"]').tap();
   await page.waitForFunction(() => location.hash === '#calendar');

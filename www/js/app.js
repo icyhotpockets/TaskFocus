@@ -1,4 +1,4 @@
-import { isNative, platformName } from "./native.js";
+import { hapticTick, isNative, platformName } from "./native.js";
 import {
   BACKUP_KEY,
   STORAGE_KEY,
@@ -18,8 +18,12 @@ import {
 } from "./core/filters.js";
 import { pickFocusTasks, groupTasksByDate } from "./core/focus.js";
 import {
+  childrenOf,
+  clearArchivedTasks,
   completeWithDescendants,
   deleteTask as deleteTaskFromModel,
+  descendantsOf,
+  progressOf,
   restoreTaskStates,
   setArchived,
 } from "./core/model.js";
@@ -70,6 +74,10 @@ let notificationUi = {
   error: "",
 };
 let notificationReconcileTimer = null;
+let activeCardGesture = null;
+let revealedTaskId = null;
+let suppressCardClickUntil = 0;
+let completionInFlight = false;
 const routeScroll = new Map();
 let touchAction = null;
 
@@ -165,7 +173,13 @@ function bindShellEvents() {
 
   document.addEventListener("click", (event) => {
     const actionTarget = event.target.closest("[data-action]");
-    if (actionTarget) handleAction(actionTarget, event);
+    if (actionTarget) {
+      if (actionTarget.dataset.action === "edit-task" && Date.now() < suppressCardClickUntil) {
+        event.preventDefault();
+        return;
+      }
+      handleAction(actionTarget, event);
+    }
 
     const picker = event.target.closest("[data-show-picker]");
     if (picker?.showPicker) {
@@ -206,6 +220,124 @@ function bindShellEvents() {
   }, { passive: false });
 
   document.addEventListener("touchcancel", () => { touchAction = null; }, { passive: true });
+  bindTaskGestures();
+}
+
+function bindTaskGestures() {
+  view.addEventListener("touchstart", (event) => {
+    const card = event.target.closest(".task-card[data-task-gesture]");
+    if (!card || event.touches.length !== 1 || event.target.closest("button")) return;
+    const taskId = Number(card.dataset.taskId);
+    const touch = event.touches[0];
+    if (revealedTaskId && revealedTaskId !== taskId) closeRevealedCard();
+    activeCardGesture = {
+      card,
+      wrap: card.closest(".task-card-wrap"),
+      taskId,
+      x: touch.clientX,
+      y: touch.clientY,
+      dx: 0,
+      dy: 0,
+      held: false,
+      moved: false,
+      closeOnly: revealedTaskId === taskId,
+      holdTimer: null,
+    };
+    if (!activeCardGesture.closeOnly) {
+      activeCardGesture.holdTimer = setTimeout(() => {
+        if (!activeCardGesture || activeCardGesture.taskId !== taskId || activeCardGesture.moved) return;
+        activeCardGesture.held = true;
+        card.classList.add("hold-armed");
+        hapticTick();
+      }, 500);
+    }
+  }, { passive: true });
+
+  view.addEventListener("touchmove", (event) => {
+    const gesture = activeCardGesture;
+    if (!gesture || event.touches.length !== 1 || gesture.closeOnly) return;
+    const touch = event.touches[0];
+    gesture.dx = touch.clientX - gesture.x;
+    gesture.dy = touch.clientY - gesture.y;
+    if (!gesture.held && Math.hypot(gesture.dx, gesture.dy) > 12) {
+      gesture.moved = true;
+      clearTimeout(gesture.holdTimer);
+    }
+    if (gesture.held && gesture.dy > 12 && Math.abs(gesture.dy) > Math.abs(gesture.dx)) {
+      event.preventDefault();
+      return;
+    }
+    if (Math.abs(gesture.dx) > 7 && Math.abs(gesture.dx) > Math.abs(gesture.dy)) {
+      event.preventDefault();
+      gesture.moved = true;
+      clearTimeout(gesture.holdTimer);
+      gesture.card.classList.add("dragging");
+      const offset = Math.max(-120, Math.min(120, gesture.dx));
+      gesture.card.style.transform = `translateX(${offset}px)`;
+      gesture.wrap?.style.setProperty("--delete-progress", String(Math.min(1, Math.max(0, -offset / 84))));
+    }
+  }, { passive: false });
+
+  view.addEventListener("touchend", (event) => {
+    const gesture = activeCardGesture;
+    if (!gesture) return;
+    activeCardGesture = null;
+    clearTimeout(gesture.holdTimer);
+    gesture.card.classList.remove("dragging", "hold-armed");
+    if (gesture.closeOnly) {
+      closeRevealedCard();
+      suppressCardClickUntil = Date.now() + 450;
+      return;
+    }
+    if (gesture.held && gesture.dy > 40 && Math.abs(gesture.dy) > Math.abs(gesture.dx)) {
+      resetDraggedCard(gesture.card, gesture.wrap);
+      toggleTaskCollapse(gesture.taskId);
+      suppressCardClickUntil = Date.now() + 450;
+      return;
+    }
+    if (gesture.held) {
+      resetDraggedCard(gesture.card, gesture.wrap);
+      suppressCardClickUntil = Date.now() + 450;
+      return;
+    }
+    if (gesture.dx > 90 && Math.abs(gesture.dx) > Math.abs(gesture.dy)) {
+      resetDraggedCard(gesture.card, gesture.wrap);
+      suppressCardClickUntil = Date.now() + 450;
+      openAddSheet(gesture.taskId);
+      return;
+    }
+    if (gesture.dx < -60 && Math.abs(gesture.dx) > Math.abs(gesture.dy)) {
+      closeRevealedCard();
+      revealedTaskId = gesture.taskId;
+      gesture.card.classList.add("is-revealed");
+      gesture.card.style.transform = "translateX(-84px)";
+      gesture.wrap?.style.setProperty("--delete-progress", "1");
+      suppressCardClickUntil = Date.now() + 450;
+      return;
+    }
+    resetDraggedCard(gesture.card, gesture.wrap);
+    if (gesture.moved) suppressCardClickUntil = Date.now() + 450;
+  }, { passive: true });
+
+  view.addEventListener("touchcancel", () => {
+    if (!activeCardGesture) return;
+    clearTimeout(activeCardGesture.holdTimer);
+    resetDraggedCard(activeCardGesture.card, activeCardGesture.wrap);
+    activeCardGesture = null;
+  }, { passive: true });
+}
+
+function resetDraggedCard(card, wrap) {
+  card?.classList.remove("dragging", "hold-armed", "is-revealed");
+  if (card) card.style.transform = "";
+  wrap?.style.removeProperty("--delete-progress");
+}
+
+function closeRevealedCard() {
+  if (!revealedTaskId) return;
+  const card = view.querySelector(`.task-card[data-task-id="${revealedTaskId}"]`);
+  resetDraggedCard(card, card?.closest(".task-card-wrap"));
+  revealedTaskId = null;
 }
 
 function handleAction(actionTarget, event) {
@@ -222,9 +354,20 @@ function handleAction(actionTarget, event) {
   } else if (action === "save-edit") {
     saveTaskEdit(Number(actionTarget.dataset.taskId));
   } else if (action === "delete-task") {
+    event?.stopPropagation();
     deleteTask(Number(actionTarget.dataset.taskId));
   } else if (action === "confirm-delete-task") {
     deleteTask(Number(actionTarget.dataset.taskId), true);
+  } else if (action === "add-subtask") {
+    event?.stopPropagation();
+    openAddSheet(Number(actionTarget.dataset.taskId));
+  } else if (action === "toggle-collapse") {
+    event?.stopPropagation();
+    toggleTaskCollapse(Number(actionTarget.dataset.taskId));
+  } else if (action === "clear-done") {
+    openClearDoneConfirmation();
+  } else if (action === "confirm-clear-done") {
+    clearDoneTasks();
   } else if (action === "open-category-filter") {
     openFilterSheet("colors");
   } else if (action === "open-tag-filter") {
@@ -332,11 +475,26 @@ function renderTasksView() {
   const completedToday = documentState.tasks.filter(
     (task) => task.completedAt && dateKey(new Date(task.completedAt)) === dateKey(now),
   );
-  const doneRoots = documentState.tasks
-    .filter((task) => task.archived && !task.parentId)
+  const archived = documentState.tasks.filter((task) => task.archived);
+  const archivedIds = new Set(archived.map((task) => task.id));
+  const doneRoots = archived
+    .filter((task) => !archivedIds.has(task.parentId))
     .sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0));
-  const focus = pickFocusTasks(open, documentState.settings.focusLimit, now.getTime());
-  const focusIds = new Set(focus.map((task) => task.id));
+  const focusPicks = pickFocusTasks(open, documentState.settings.focusLimit, now.getTime());
+  const openIds = new Set(open.map((task) => task.id));
+  const focusDisplay = [];
+  const focusIds = new Set();
+  for (const task of focusPicks) {
+    if (focusIds.has(task.id)) continue;
+    focusDisplay.push(task);
+    focusIds.add(task.id);
+    if (!openIds.has(task.parentId)) {
+      for (const descendant of descendantsOf(open, task.id)) {
+        focusDisplay.push(descendant);
+        focusIds.add(descendant.id);
+      }
+    }
+  }
   const remaining = open.filter((task) => !focusIds.has(task.id));
   const groups = groupTasksByDate(remaining, now.getTime());
   const filtering = hasActiveFilters(activeFilters);
@@ -371,7 +529,7 @@ function renderTasksView() {
           ? renderTaskSection("Filtered tasks", filtered, "filtered", false, true)
           : renderNoFilterMatches()}
       ` : open.length === 0 ? renderEmptyState() : `
-        ${focus.length ? renderTaskSection("Your focus", focus, "focus", true) : ""}
+        ${focusPicks.length ? renderTaskSection("Your focus", focusDisplay, "focus", true, false, focusPicks.length) : ""}
         ${groups.overdue.length ? renderTaskSection("Overdue", groups.overdue, "overdue") : ""}
         ${groups.today.length ? renderTaskSection("Today", groups.today, "today") : ""}
         ${groups.upcoming.length ? renderTaskSection("Upcoming", groups.upcoming, "upcoming") : ""}
@@ -410,21 +568,45 @@ function renderEmptyState() {
   `;
 }
 
-function renderTaskSection(title, tasks, key, focus = false, parentLabels = false) {
+function renderTaskSection(title, tasks, key, focus = false, parentLabels = false, count = tasks.length) {
+  const cards = parentLabels
+    ? tasks.map((task, index) => renderTaskCard(task, index, {
+      parentLabel: parentTitle(task),
+      hasChildren: childrenOf(documentState.tasks, task.id).length > 0,
+    })).join("")
+    : renderTaskForest(tasks);
   return `
     <section class="section" aria-labelledby="section-${key}">
       <div class="section-heading-row">
         <h2 id="section-${key}">${escapeHtml(title)}</h2>
-        <span class="section-count">${tasks.length}${focus ? ` of ${documentState.settings.focusLimit}` : ""}</span>
+        <span class="section-count">${count}${focus ? ` of ${documentState.settings.focusLimit}` : ""}</span>
       </div>
-      <div class="task-list">${tasks.map((task, index) => renderTaskCard(task, index, {
-        parentLabel: parentLabels ? parentTitle(task) : "",
-      })).join("")}</div>
+      <div class="task-list">${cards}</div>
     </section>
   `;
 }
 
-function renderTaskCard(task, index = 0, { parentLabel = "" } = {}) {
+function renderTaskForest(tasks, { parentLabels = false } = {}) {
+  const allowed = new Set(tasks.map((task) => task.id));
+  const roots = tasks.filter((task) => !allowed.has(task.parentId));
+  let index = 0;
+  const renderNode = (task, depth = 0) => {
+    const children = childrenOf(documentState.tasks, task.id).filter((child) => allowed.has(child.id));
+    const parentLabel = parentLabels || (task.parentId && !allowed.has(task.parentId)) ? parentTitle(task) : "";
+    const card = renderTaskCard(task, index++, { parentLabel, depth, hasChildren: children.length > 0 });
+    if (!children.length) return `<div class="task-tree-node" data-tree-task-id="${task.id}">${card}</div>`;
+    return `
+      <div class="task-tree-node has-children ${task.collapsed ? "is-collapsed" : ""}" data-tree-task-id="${task.id}">
+        ${card}
+        <div class="task-children" data-children-of="${task.id}"><div class="task-children-inner">
+          ${children.map((child) => renderNode(child, depth + 1)).join("")}
+        </div></div>
+      </div>`;
+  };
+  return roots.map((task) => renderNode(task)).join("");
+}
+
+function renderTaskCard(task, index = 0, { parentLabel = "", depth = 0, hasChildren = false } = {}) {
   const due = task.due ? dueChip(task) : "";
   const timer = task.session
     ? `<span class="chip progress">⏱ ${sessionTimeLabel(task)}</span>`
@@ -438,17 +620,22 @@ function renderTaskCard(task, index = 0, { parentLabel = "" } = {}) {
     : "";
   const tag = task.tags?.length ? `<span class="chip">#${escapeHtml(task.tags[0])}${task.tags.length > 1 ? ` +${task.tags.length - 1}` : ""}</span>` : "";
   const done = Boolean(task.completedAt);
+  const progress = progressOf(documentState.tasks, task.id);
+  const progressChip = progress.total ? `<span class="chip progress">${progress.done}/${progress.total}</span>` : "";
 
   return `
-    <div class="task-card-wrap ${task.parentId ? "tree-child" : ""}" style="--i:${index}">
-      <article class="task-card ${done ? "is-done" : ""}" data-action="edit-task" data-task-id="${task.id}" tabindex="0">
+    <div class="task-card-wrap ${depth ? "tree-child" : ""}" data-card-wrap="${task.id}" style="--i:${index};--tree-depth:${depth}">
+      <button class="task-delete-reveal" type="button" data-action="delete-task" data-task-id="${task.id}" aria-label="Delete ${escapeAttribute(task.title)}">
+        <svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5"></path></svg>
+      </button>
+      <article class="task-card ${done ? "is-done" : ""} ${revealedTaskId === task.id ? "is-revealed" : ""}" data-action="edit-task" data-task-id="${task.id}" data-task-gesture tabindex="0">
         <button class="task-check ${done ? "done" : ""}" type="button" data-action="toggle-task" data-task-id="${task.id}" aria-label="${done ? "Mark open" : "Complete"} ${escapeHtml(task.title)}">
           <svg viewBox="0 0 20 20"><path d="m4 10 4 4 8-9"></path></svg>
         </button>
         <div class="task-content">
           ${parentLabel ? `<p class="parent-label">${escapeHtml(parentLabel)}</p>` : ""}
           <p class="task-title">${escapeHtml(task.title)}</p>
-          ${due || timer || reminder || priority || category || tag ? `<div class="task-meta">${category}${due}${timer}${priority}${reminder}${tag}</div>` : ""}
+          ${due || timer || reminder || priority || category || tag || progressChip ? `<div class="task-meta">${category}${due}${timer}${priority}${reminder}${progressChip}${tag}</div>` : ""}
         </div>
         <div class="task-trailing">
           ${!done && (task.timer || task.breaks) ? `
@@ -456,7 +643,11 @@ function renderTaskCard(task, index = 0, { parentLabel = "" } = {}) {
               <svg viewBox="0 0 24 24">${task.session ? '<rect x="8" y="8" width="8" height="8" rx="1"></rect>' : '<path d="m9 7 8 5-8 5Z"></path>'}</svg>
             </button>
           ` : ""}
-          <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" style="fill:none;stroke:var(--text-faint);stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><path d="m9 6 6 6-6 6"></path></svg>
+          ${hasChildren ? `
+            <button class="tree-chevron ${task.collapsed ? "collapsed" : ""}" type="button" data-action="toggle-collapse" data-task-id="${task.id}" aria-label="${task.collapsed ? "Expand" : "Collapse"} subtasks" aria-expanded="${!task.collapsed}">
+              <svg viewBox="0 0 24 24"><path d="m7 9 5 5 5-5"></path></svg>
+            </button>
+          ` : `<svg class="edit-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"></path></svg>`}
         </div>
       </article>
     </div>
@@ -465,12 +656,14 @@ function renderTaskCard(task, index = 0, { parentLabel = "" } = {}) {
 
 function renderDoneSection(doneRoots) {
   if (!doneRoots.length) return "";
+  const archived = documentState.tasks.filter((task) => task.archived);
   return `
     <section class="section">
       <details class="done-details" data-detail-key="done">
         <summary><span>Done (${doneRoots.length})</span><span aria-hidden="true">⌄</span></summary>
         <div class="done-body">
-          <div class="task-list">${doneRoots.slice(0, 30).map((task, index) => renderTaskCard(task, index)).join("")}</div>
+          <div class="task-list">${renderTaskForest(archived.filter((task) => doneRoots.slice(0, 30).some((root) => root.id === task.id || descendantsOf(archived, root.id).some((child) => child.id === task.id))))}</div>
+          <button class="button danger clear-done-button" type="button" data-action="clear-done">Clear all (${archived.length})</button>
         </div>
       </details>
     </section>
@@ -571,7 +764,7 @@ function renderCalendarView() {
           <span class="section-count">${selectedTasks.length}</span>
         </div>
         ${selectedTasks.length
-          ? `<div class="task-list">${selectedTasks.map((task, index) => renderTaskCard(task, index)).join("")}</div>`
+          ? `<div class="task-list">${renderTaskForest(selectedTasks, { parentLabels: true })}</div>`
           : `<div class="settings-card"><span class="muted small">Nothing scheduled. Tap + to add something.</span></div>`}
       </section>
     </div>
@@ -692,7 +885,7 @@ function renderSettingsView() {
           </div>
           <div class="build-status-list">
             <div class="build-status-row"><span>Task editor, filters, backup, basic focus timer</span><span class="status-pill ready">Ready</span></div>
-            <div class="build-status-row"><span>Subtasks, gestures, completion animation</span><span class="status-pill next">Next</span></div>
+            <div class="build-status-row"><span>Subtasks, gestures, completion animation</span><span class="status-pill ready">Ready</span></div>
             <div class="build-status-row"><span>Android reminders and notification actions</span><span class="status-pill ${isNative ? "ready" : "next"}">${isNative ? "Ready" : "Android"}</span></div>
             <div class="build-status-row"><span>iPhone background push</span><span class="status-pill planned">Planned</span></div>
           </div>
@@ -853,11 +1046,17 @@ function isClockValue(value) {
   return Boolean(match && Number(match[1]) < 24 && Number(match[2]) < 60);
 }
 
-function openAddSheet() {
+function openAddSheet(parentId = null) {
+  const parent = parentId ? documentState.tasks.find((task) => task.id === parentId) : null;
+  if (parentId && (!parent || parent.completedAt || parent.archived)) {
+    showToast("Move the parent back to open before adding a subtask.");
+    return;
+  }
   currentSheet = {
     type: "editor",
     mode: "add",
     taskId: null,
+    parentId: parent?.id ?? null,
     activeOption: null,
     draft: createEditorDraft(),
   };
@@ -909,15 +1108,16 @@ function createEditorDraft(task = null) {
 function renderEditorSheet({ autoFocus = false } = {}) {
   if (currentSheet?.type !== "editor") return;
   const previousScroll = sheetsRoot.querySelector(".sheet")?.scrollTop || 0;
-  const { mode, taskId, draft, activeOption } = currentSheet;
+  const { mode, taskId, parentId, draft, activeOption } = currentSheet;
   const isAdd = mode === "add";
+  const parent = parentId ? documentState.tasks.find((task) => task.id === parentId) : null;
   sheetsRoot.innerHTML = `
     <div class="sheet-layer" role="presentation">
       <button class="sheet-scrim" type="button" data-action="close-sheet" aria-label="Close ${isAdd ? "add task" : "task editor"}"></button>
       <section class="sheet editor-sheet" role="dialog" aria-modal="true" aria-labelledby="editor-sheet-title">
         <div class="sheet-grabber" aria-hidden="true"></div>
         <header class="sheet-header">
-          <h2 class="sheet-title" id="editor-sheet-title">${isAdd ? "Add task" : "Edit task"}</h2>
+          <div><h2 class="sheet-title" id="editor-sheet-title">${isAdd ? (parent ? "Add subtask" : "Add task") : "Edit task"}</h2>${parent ? `<p class="sheet-subtitle">Under ${escapeHtml(parent.title)}</p>` : ""}</div>
           <button class="sheet-close" type="button" data-action="close-sheet" aria-label="Close">×</button>
         </header>
         ${isAdd ? `
@@ -936,9 +1136,10 @@ function renderEditorSheet({ autoFocus = false } = {}) {
         `}
         <div class="option-toolbar" aria-label="Task options">${renderOptionToolbar(draft, activeOption)}</div>
         <div class="option-panel-wrap">${renderOptionPanel(activeOption, draft)}</div>
+        ${isAdd ? "" : `<button class="button ghost add-subtask-button" type="button" data-action="add-subtask" data-task-id="${taskId}">+ Add subtask (${childrenOf(documentState.tasks, taskId).length})</button>`}
         <div class="sheet-actions ${isAdd ? "single" : ""}">
           ${isAdd ? "" : `<button class="button danger" type="button" data-action="delete-task" data-task-id="${taskId}">Delete</button>`}
-          <button class="button primary ${isAdd ? "full" : ""}" type="button" data-action="${isAdd ? "add-task" : "save-edit"}" ${isAdd ? "" : `data-task-id="${taskId}"`}>${isAdd ? "Add task" : "Save"}</button>
+          <button class="button primary ${isAdd ? "full" : ""}" type="button" data-action="${isAdd ? "add-task" : "save-edit"}" ${isAdd ? "" : `data-task-id="${taskId}"`}>${isAdd ? (parent ? "Add subtask" : "Add task") : "Save"}</button>
         </div>
       </section>
     </div>
@@ -1085,7 +1286,7 @@ function closeSheet() {
 function submitAddTask() {
   if (currentSheet?.type !== "editor" || currentSheet.mode !== "add") return;
   captureVisibleDraft();
-  const { draft } = currentSheet;
+  const { draft, parentId } = currentSheet;
   const source = draft.source.trim();
   if (!source) {
     sheetsRoot.querySelector("#quick-task-input")?.focus();
@@ -1107,16 +1308,20 @@ function submitAddTask() {
     breaks: draft.breaks,
     muteDuringSession: draft.muteDuringSession,
     session: null,
-    parentId: null,
+    parentId,
     collapsed: false,
     archived: false,
     completedAt: null,
   }, now);
+  if (parentId) {
+    const parent = documentState.tasks.find((task) => task.id === parentId);
+    if (parent) parent.collapsed = false;
+  }
   scheduleSave();
   closeSheet();
   if (currentRoute !== "tasks") location.hash = "#tasks";
   else rerender({ entry: true });
-  showToast("Task added");
+  showToast(parentId ? "Subtask added" : "Task added");
 }
 
 function saveTaskEdit(taskId) {
@@ -1429,18 +1634,108 @@ function renderDeleteConfirmation() {
   bindSheetDrag();
 }
 
-function toggleTask(taskId) {
+function openClearDoneConfirmation() {
+  const count = documentState.tasks.filter((task) => task.archived).length;
+  if (!count) return;
+  currentSheet = { type: "clear-done-confirm", count };
+  document.body.classList.add("sheet-open");
+  sheetsRoot.innerHTML = `
+    <div class="sheet-layer" role="presentation">
+      <button class="sheet-scrim" type="button" data-action="close-sheet" aria-label="Cancel clearing completed tasks"></button>
+      <section class="sheet confirm-sheet" role="alertdialog" aria-modal="true" aria-labelledby="clear-done-title">
+        <div class="sheet-grabber" aria-hidden="true"></div>
+        <header class="sheet-header">
+          <h2 class="sheet-title" id="clear-done-title">Clear all completed tasks?</h2>
+          <button class="sheet-close" type="button" data-action="close-sheet" aria-label="Close">×</button>
+        </header>
+        <p class="confirm-copy">This permanently deletes ${count} completed ${count === 1 ? "task" : "tasks"}, including archived subtasks.</p>
+        <div class="sheet-actions">
+          <button class="button ghost" type="button" data-action="close-sheet">Cancel</button>
+          <button class="button danger" type="button" data-action="confirm-clear-done">Clear all</button>
+        </div>
+      </section>
+    </div>`;
+  bindSheetDrag();
+}
+
+function clearDoneTasks() {
+  const result = clearArchivedTasks(documentState.tasks);
+  if (!result.deletedIds.length) return;
+  documentState.tasks = result.tasks;
+  scheduleSave();
+  closeSheet();
+  rerender();
+  showToast(`Cleared ${result.deletedIds.length} completed ${result.deletedIds.length === 1 ? "task" : "tasks"}`);
+}
+
+function toggleTaskCollapse(taskId) {
+  const task = documentState.tasks.find((item) => item.id === taskId);
+  if (!task || !childrenOf(documentState.tasks, taskId).length) return;
+  task.collapsed = !task.collapsed;
+  scheduleSave();
+  const node = view.querySelector(`.task-tree-node[data-tree-task-id="${taskId}"]`);
+  node?.classList.toggle("is-collapsed", task.collapsed);
+  const chevron = node?.querySelector(`:scope > .task-card-wrap .tree-chevron[data-task-id="${taskId}"]`);
+  chevron?.classList.toggle("collapsed", task.collapsed);
+  chevron?.setAttribute("aria-expanded", String(!task.collapsed));
+  chevron?.setAttribute("aria-label", `${task.collapsed ? "Expand" : "Collapse"} subtasks`);
+}
+
+async function toggleTask(taskId) {
+  if (completionInFlight) return;
   const result = completeWithDescendants(documentState.tasks, taskId, Date.now());
   if (!result.previousStates.length) return;
+  completionInFlight = true;
+  const visibleChecks = result.previousStates
+    .map(({ id }) => view.querySelector(`.task-check[data-task-id="${id}"]`))
+    .filter(Boolean);
+  const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (!reducedMotion) {
+    visibleChecks.forEach((check, index) => animateTaskCheck(check, result.completed, index * 90));
+    await new Promise((resolve) => setTimeout(resolve, Math.max(360, (visibleChecks.length - 1) * 90 + 520)));
+  }
   documentState.tasks = result.completed ? setArchived(result.tasks, taskId, true) : result.tasks;
   scheduleSave();
   rerender();
+  completionInFlight = false;
   const descendantCount = result.previousStates.length - 1;
   showToast(result.completed ? `Done${descendantCount ? ` (+${descendantCount} subtasks)` : ""}` : "Moved back to open tasks", result.completed ? () => {
     documentState.tasks = restoreTaskStates(documentState.tasks, result.previousStates);
     scheduleSave();
     rerender();
   } : null);
+}
+
+function animateTaskCheck(check, completing, delay) {
+  const card = check.closest(".task-card");
+  setTimeout(() => {
+    addCheckBubbles(check, completing);
+    check.classList.add(completing ? "animating-complete" : "animating-uncomplete");
+    card?.classList.add(completing ? "completion-landing" : "completion-lifting");
+    if (completing) {
+      setTimeout(() => {
+        check.classList.add("done");
+        card?.classList.add("is-done");
+      }, 260);
+    } else {
+      check.classList.remove("done");
+      card?.classList.remove("is-done");
+    }
+  }, delay);
+}
+
+function addCheckBubbles(check, completing) {
+  const bubbles = document.createElement("span");
+  bubbles.className = `check-bubbles ${completing ? "converge" : "burst"}`;
+  bubbles.setAttribute("aria-hidden", "true");
+  for (let index = 0; index < 12; index += 1) {
+    const bubble = document.createElement("i");
+    bubble.style.setProperty("--bubble-index", String(index));
+    bubble.style.setProperty("--bubble-color", index % 3 === 0 ? "var(--accent)" : index % 3 === 1 ? "var(--accent-bright)" : "var(--accent-deep)");
+    bubbles.append(bubble);
+  }
+  check.append(bubbles);
+  setTimeout(() => bubbles.remove(), 700);
 }
 
 function toggleSession(taskId) {

@@ -423,7 +423,7 @@ try {
   let configuredCard = page.locator('.task-card').filter({ hasText: 'Configured task' }).first();
   await configuredCard.getByRole('button', { name: 'Start focus session' }).tap();
   await configuredCard.getByRole('button', { name: 'Stop focus session' }).waitFor();
-  await configuredCard.locator('.chip.progress').waitFor();
+  await configuredCard.locator('.chip.progress').filter({ hasText: '⏱' }).waitFor();
   await configuredCard.getByRole('button', { name: 'Stop focus session' }).tap();
   await configuredCard.getByRole('button', { name: 'Start focus session' }).waitFor();
   await configuredCard.getByRole('button', { name: 'Complete Configured task' }).tap();

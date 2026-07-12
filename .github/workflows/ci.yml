@@ -56,3 +56,26 @@ jobs:
 
       - name: Exercise the mobile shell at 412x915
         run: npm run test:e2e
+
+  worker:
+    name: Web Push encryption
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Install Worker dependencies
+        working-directory: worker
+        run: npm ci
+
+      - name: Verify RFC 8291 aes128gcm round trip
+        working-directory: worker
+        run: npm test

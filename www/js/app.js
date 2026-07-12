@@ -37,6 +37,12 @@ import {
   scheduleNativeTestNotification,
   taskIdFromNotificationAction,
 } from "./notifications.js";
+import {
+  enableWebPush,
+  getWebPushStatus,
+  syncWebPush,
+  testWebPush,
+} from "./webpush.js";
 import { parseQuickAdd } from "./core/parser.js";
 import { CATEGORY_COLORS } from "./core/themes.js";
 import { checkForNativeUpdate } from "./update.js";
@@ -71,6 +77,8 @@ let notificationUi = {
   permission: isNative ? "prompt" : "unavailable",
   exact: isNative ? "prompt" : "unavailable",
   pending: 0,
+  configured: isNative,
+  subscribed: false,
   error: "",
 };
 let notificationReconcileTimer = null;
@@ -100,6 +108,7 @@ window.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
     loadBuildVersion({ reloadOnChange: true });
     reconcileFinishedSessions();
+    reconcileNotificationsNow({ render: false });
     if (!currentSheet) rerender();
   }
 });
@@ -775,10 +784,10 @@ function renderSettingsView() {
   const currentTheme = themes[documentState.settings.theme] || themes.ember;
   const family = themeFamilies[selectedThemeFamily];
   const permissionCopy = notificationUi.permission === "granted"
-    ? `${notificationUi.pending} alarms currently scheduled`
+    ? (isNative ? `${notificationUi.pending} alarms currently scheduled` : notificationUi.subscribed ? "Connected for background push" : "Permission allowed; finishing subscription")
     : notificationUi.permission === "denied"
-      ? "Blocked in Android notification settings"
-      : isNative ? "Tap Enable to allow reminders" : "iPhone push connection comes after Android delivery";
+      ? `Blocked in ${isNative ? "Android" : "iPhone"} notification settings`
+      : isNative ? "Tap Enable to allow reminders" : notificationUi.configured ? "Tap Enable from the installed home-screen app" : "Push server configuration is required";
   const exactCopy = notificationUi.exact === "granted"
     ? "Exact alarms allowed"
     : "Approval needed for on-time delivery";
@@ -811,11 +820,9 @@ function renderSettingsView() {
           </div>
           <div class="setting-row">
             <div class="setting-label"><strong>Permission</strong><span>${escapeHtml(permissionCopy)}</span></div>
-            ${isNative ? `
-              <button class="button" type="button" data-action="enable-notifications" ${notificationUi.permission === "granted" ? "disabled" : ""}>
-                ${notificationUi.permission === "granted" ? "Enabled" : "Enable"}
-              </button>
-            ` : `<button class="button" type="button" disabled>iPhone next</button>`}
+            <button class="button" type="button" data-action="enable-notifications" ${notificationUi.permission === "granted" && (isNative || notificationUi.subscribed) ? "disabled" : ""}>
+              ${notificationUi.permission === "granted" && (isNative || notificationUi.subscribed) ? "Enabled" : "Enable"}
+            </button>
           </div>
           ${isNative ? `
             <div class="setting-row">
@@ -836,7 +843,11 @@ function renderSettingsView() {
             </div>
             <div class="guidance-row">For reliable reminders: Android Settings → Apps → TaskFocus → Battery → Unrestricted.</div>
           ` : `
-            <div class="guidance-row">iPhone background reminders require Add to Home Screen and the upcoming push connection.</div>
+            <div class="setting-row stacked-setting-row">
+              <div class="setting-label"><strong>Test delivery</strong><span>Queues one iPhone push for 2 minutes from now</span></div>
+              <button class="button" type="button" data-action="test-notification" ${notificationUi.permission === "granted" && notificationUi.subscribed ? "" : "disabled"}>Test</button>
+            </div>
+            <div class="guidance-row">Install with Safari → Share → Add to Home Screen. Your iPhone controls sound at Settings → Notifications → TaskFocus → Sounds; silent mode and Focus modes can also mute it.</div>
           `}
           ${notificationUi.error ? `<div class="guidance-row error-copy">${escapeHtml(notificationUi.error)}</div>` : ""}
         </section>
@@ -887,7 +898,8 @@ function renderSettingsView() {
             <div class="build-status-row"><span>Task editor, filters, backup, basic focus timer</span><span class="status-pill ready">Ready</span></div>
             <div class="build-status-row"><span>Subtasks, gestures, completion animation</span><span class="status-pill ready">Ready</span></div>
             <div class="build-status-row"><span>Android reminders and notification actions</span><span class="status-pill ${isNative ? "ready" : "next"}">${isNative ? "Ready" : "Android"}</span></div>
-            <div class="build-status-row"><span>iPhone background push</span><span class="status-pill planned">Planned</span></div>
+            <div class="build-status-row"><span>iPhone background push</span><span class="status-pill ${notificationUi.configured ? "ready" : "next"}">${notificationUi.configured ? "Ready" : "Cloudflare setup"}</span></div>
+            <div class="build-status-row"><span>Timing wheels and update delivery</span><span class="status-pill ready">Ready</span></div>
           </div>
         </section>
 
@@ -1145,6 +1157,7 @@ function renderEditorSheet({ autoFocus = false } = {}) {
     </div>
   `;
   bindSheetDrag();
+  bindTimingWheels();
   requestAnimationFrame(() => {
     const sheet = sheetsRoot.querySelector(".sheet");
     if (sheet) sheet.scrollTop = previousScroll;
@@ -1233,24 +1246,139 @@ function renderOptionPanel(option, draft) {
 }
 
 function renderTimingPanel(draft) {
-  const intervalLabel = isNative ? "Notify me every…" : "Notify me every… (iPhone push setup pending)";
+  const intervalLabel = "Notify me every…";
   const timingNote = isNative
     ? "Minute entry is functional. Android reminders schedule after notification permission is enabled."
-    : "Minute entry is functional. iPhone background delivery needs the upcoming push connection.";
+    : notificationUi.configured
+      ? "iPhone reminders sync to the push relay after notification permission is enabled."
+      : "Timing is saved now; iPhone delivery activates after the Cloudflare connection is configured.";
   return `
     <section class="option-panel" data-option-panel="timing">
       ${renderTimingSwitch(intervalLabel, "reminder-enabled", Boolean(draft.reminder), draft.reminder ? `
-        <label class="inline-duration"><span>Every</span><input class="input duration-input" type="number" inputmode="numeric" min="1" max="1440" data-field="interval-min" value="${draft.intervalMin}"><span>minutes</span></label>` : "")}
+        ${renderDurationWheel("interval-min", draft.intervalMin, 1440, "Every")}` : "")}
       ${renderTimingSwitch("Task timer", "timer-enabled", Boolean(draft.timer), draft.timer ? `
-        <label class="inline-duration"><span>Duration</span><input class="input duration-input" type="number" inputmode="numeric" min="1" max="1440" data-field="timer-min" value="${draft.timerMin}"><span>minutes</span></label>` : "")}
+        ${renderDurationWheel("timer-min", draft.timerMin, 1440, "Duration")}` : "")}
       ${renderTimingSwitch("Breaks", "breaks-enabled", Boolean(draft.breaks), draft.breaks ? `
         <div class="duration-pair">
-          <label class="inline-duration"><span>Work</span><input class="input duration-input" type="number" inputmode="numeric" min="1" max="240" data-field="work-min" value="${draft.workMin}"><span>min</span></label>
-          <label class="inline-duration"><span>Break</span><input class="input duration-input" type="number" inputmode="numeric" min="1" max="120" data-field="break-min" value="${draft.breakMin}"><span>min</span></label>
+          ${renderDurationWheel("work-min", draft.workMin, 240, "Work")}
+          ${renderDurationWheel("break-min", draft.breakMin, 120, "Break")}
         </div>` : "")}
       ${draft.timer || draft.breaks ? renderTimingSwitch("Silence intervals during a session", "mute-session", draft.muteDuringSession) : ""}
       <p class="field-help timing-note">${escapeHtml(timingNote)}</p>
     </section>`;
+}
+
+function renderDurationWheel(field, totalMinutes, maxMinutes, label) {
+  const value = Math.min(maxMinutes, Math.max(1, Math.round(totalMinutes)));
+  const hours = Math.floor(value / 60);
+  const minutes = value % 60;
+  const hourValues = Array.from({ length: Math.floor(maxMinutes / 60) + 1 }, (_, index) => index);
+  const minuteValues = Array.from({ length: 60 }, (_, index) => index);
+  const column = (unit, values, selected) => `
+    <div class="time-wheel-column">
+      <div class="time-wheel" role="listbox" tabindex="0" aria-label="${label} ${unit}" data-wheel-unit="${unit}" data-val="${selected}">
+        ${values.map((number) => `<div class="time-wheel-item ${number === selected ? "selected" : ""}" role="option" aria-selected="${number === selected}" data-value="${number}">${String(number).padStart(2, "0")}</div>`).join("")}
+      </div>
+      <span>${unit === "hours" ? "hr" : "min"}</span>
+    </div>`;
+  return `
+    <div class="duration-wheel-row" data-duration-field="${field}" data-val="${value}" data-min="1" data-max="${maxMinutes}">
+      <strong>${label}</strong>
+      <div class="duration-wheels">
+        ${column("hours", hourValues, hours)}
+        ${column("minutes", minuteValues, minutes)}
+        <div class="wheel-highlight" aria-hidden="true"></div>
+      </div>
+    </div>`;
+}
+
+function bindTimingWheels() {
+  const rows = [...sheetsRoot.querySelectorAll(".duration-wheel-row")];
+  for (const row of rows) {
+    const wheels = [...row.querySelectorAll(".time-wheel")];
+    for (const wheel of wheels) {
+      const selected = wheel.querySelector(`.time-wheel-item[data-value="${wheel.dataset.val}"]`);
+      wheel.dataset.programmatic = "true";
+      wheel.scrollTop = selected ? selected.offsetTop - 72 : 0;
+      requestAnimationFrame(() => { delete wheel.dataset.programmatic; });
+      wheel.addEventListener("scroll", () => {
+        if (wheel.dataset.programmatic) return;
+        clearTimeout(wheel._settleTimer);
+        wheel._settleTimer = setTimeout(() => commitWheelPosition(row, wheel), 90);
+      }, { passive: true });
+    }
+
+    let drag = null;
+    row.addEventListener("pointerdown", (event) => {
+      if (event.pointerType === "mouse" && event.button !== 0) return;
+      const wheel = nearestWheel(wheels, event.clientX);
+      if (!wheel) return;
+      drag = { wheel, y: event.clientY, scrollTop: wheel.scrollTop };
+      row.setPointerCapture?.(event.pointerId);
+      wheel.classList.add("custom-dragging");
+    });
+    row.addEventListener("pointermove", (event) => {
+      if (!drag) return;
+      event.preventDefault();
+      drag.wheel.scrollTop = drag.scrollTop + drag.y - event.clientY;
+    });
+    const finish = () => {
+      if (!drag) return;
+      const { wheel } = drag;
+      drag = null;
+      commitWheelPosition(row, wheel, true);
+      setTimeout(() => wheel.classList.remove("custom-dragging"), 240);
+    };
+    row.addEventListener("pointerup", finish);
+    row.addEventListener("pointercancel", finish);
+  }
+}
+
+function nearestWheel(wheels, x) {
+  return wheels.reduce((nearest, wheel) => {
+    const distance = Math.abs(wheel.getBoundingClientRect().left + wheel.offsetWidth / 2 - x);
+    return !nearest || distance < nearest.distance ? { wheel, distance } : nearest;
+  }, null)?.wheel || null;
+}
+
+function commitWheelPosition(row, wheel, smooth = false) {
+  const items = [...wheel.querySelectorAll(".time-wheel-item")];
+  const index = Math.max(0, Math.min(items.length - 1, Math.round(wheel.scrollTop / 36)));
+  const item = items[index];
+  wheel.dataset.val = item.dataset.value;
+  wheel.dataset.programmatic = "true";
+  wheel.scrollTo({ top: index * 36, behavior: smooth ? "smooth" : "auto" });
+  items.forEach((candidate) => {
+    const selected = candidate === item;
+    candidate.classList.toggle("selected", selected);
+    candidate.setAttribute("aria-selected", String(selected));
+  });
+  setTimeout(() => { delete wheel.dataset.programmatic; }, smooth ? 260 : 0);
+  const hours = Number(row.querySelector('[data-wheel-unit="hours"]')?.dataset.val || 0);
+  const minutes = Number(row.querySelector('[data-wheel-unit="minutes"]')?.dataset.val || 0);
+  const value = Math.max(Number(row.dataset.min), Math.min(Number(row.dataset.max), hours * 60 + minutes));
+  row.dataset.val = String(value);
+  updateDurationDraft(row.dataset.durationField, value);
+}
+
+function updateDurationDraft(field, value) {
+  if (currentSheet?.type !== "editor") return;
+  const { draft } = currentSheet;
+  if (field === "interval-min") {
+    draft.intervalMin = value;
+    if (draft.reminder) draft.reminder.intervalMin = value;
+    draft.clearedTypes.add("reminder");
+  } else if (field === "timer-min") {
+    draft.timerMin = value;
+    if (draft.timer) draft.timer.durationMin = value;
+  } else if (field === "work-min") {
+    draft.workMin = value;
+    if (draft.breaks) draft.breaks.workMin = value;
+  } else if (field === "break-min") {
+    draft.breakMin = value;
+    if (draft.breaks) draft.breaks.breakMin = value;
+  }
+  refreshEditorToolbar();
 }
 
 function renderTimingSwitch(label, field, checked, details = "") {
@@ -1836,31 +1964,30 @@ function confirmImport() {
 }
 
 async function initializeNotificationRuntime() {
-  if (!isNative) return;
   try {
-    await configureNativeNotifications({
-      onAction: handleNativeNotificationAction,
-      onResume: handleNativeResume,
-    });
+    if (isNative) {
+      await configureNativeNotifications({
+        onAction: handleNativeNotificationAction,
+        onResume: handleNativeResume,
+      });
+    }
     await refreshNotificationUi({ render: false });
     if (notificationUi.permission === "granted") await reconcileNotificationsNow({ render: false });
     if (currentRoute === "settings" && !currentSheet) rerender();
   } catch (error) {
-    notificationUi.error = error instanceof Error ? error.message : "Android notification setup failed.";
+    notificationUi.error = error instanceof Error ? error.message : "Notification setup failed.";
     if (currentRoute === "settings" && !currentSheet) rerender();
   }
 }
 
 function queueNotificationReconcile() {
-  if (!isNative) return;
   clearTimeout(notificationReconcileTimer);
   notificationReconcileTimer = setTimeout(() => reconcileNotificationsNow(), 400);
 }
 
 async function refreshNotificationUi({ render = true } = {}) {
-  if (!isNative) return notificationUi;
   try {
-    notificationUi = { ...await getNativeNotificationStatus(), error: "" };
+    notificationUi = { ...(isNative ? await getNativeNotificationStatus() : await getWebPushStatus()), error: "" };
   } catch (error) {
     notificationUi.error = error instanceof Error ? error.message : "Could not read notification status.";
   }
@@ -1869,10 +1996,10 @@ async function refreshNotificationUi({ render = true } = {}) {
 }
 
 async function reconcileNotificationsNow({ render = true } = {}) {
-  if (!isNative) return;
   clearTimeout(notificationReconcileTimer);
   try {
-    await reconcileNativeNotifications(documentState);
+    if (isNative) await reconcileNativeNotifications(documentState);
+    else await syncWebPush(documentState);
     await refreshNotificationUi({ render });
   } catch (error) {
     notificationUi.error = error instanceof Error ? error.message : "Could not schedule reminders.";
@@ -1881,17 +2008,18 @@ async function reconcileNotificationsNow({ render = true } = {}) {
 }
 
 async function enableNotifications() {
-  if (!isNative) return;
   try {
-    const permission = await requestNativeNotificationPermission();
+    const permission = isNative
+      ? await requestNativeNotificationPermission()
+      : await enableWebPush(documentState);
     if (permission !== "granted") {
       notificationUi.permission = permission;
-      showToast("Android notification permission was not granted.");
+      showToast(`${isNative ? "Android" : "iPhone"} notification permission was not granted.`);
       await refreshNotificationUi();
       return;
     }
     await reconcileNotificationsNow();
-    showToast("Android reminders enabled");
+    showToast(`${isNative ? "Android reminders" : "iPhone push"} enabled`);
   } catch (error) {
     notificationUi.error = error instanceof Error ? error.message : "Could not enable notifications.";
     rerender();
@@ -1910,12 +2038,13 @@ async function requestExactNotifications() {
 }
 
 async function testNotification() {
-  if (!isNative || notificationUi.permission !== "granted") {
-    showToast("Enable Android notifications first.");
+  if (notificationUi.permission !== "granted") {
+    showToast(`Enable ${isNative ? "Android" : "iPhone"} notifications first.`);
     return;
   }
   try {
-    await scheduleNativeTestNotification();
+    if (isNative) await scheduleNativeTestNotification();
+    else await testWebPush();
     await refreshNotificationUi();
     showToast("Test scheduled for 2 minutes. Close TaskFocus and watch the lock screen.");
   } catch (error) {

@@ -1,0 +1,16 @@
+name = "taskfocus-push"
+main = "src/index.js"
+compatibility_date = "2026-07-12"
+
+[vars]
+ALLOWED_ORIGIN = "https://icyhotpockets.github.io"
+VAPID_PUBLIC_KEY = "BDbHQqC9eKYs8besRzUX3-30Q_UY2t9mi4xgvfwmN7VFAGQvQkHlhk2xbn2lAhrtILy1wicWICbvPRHpX0_tIOU"
+VAPID_SUBJECT = "mailto:taskfocus@users.noreply.github.com"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "taskfocus-push"
+database_id = "REPLACED_BY_CI"
+
+[triggers]
+crons = ["* * * * *"]

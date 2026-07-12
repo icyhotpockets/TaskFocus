@@ -141,7 +141,7 @@ Notification planners remain pure. Platform glue consumes their rows.
 
 Background reminders require Web Push from an installed iOS 16.4+ home-screen PWA. Notification permission must be requested synchronously inside the user tap before any intervening await. The client keeps a device UUID, posts its subscription, and replaces its complete schedule.
 
-Cloudflare Worker + D1 stores subscriptions, pending rows, and a diagnostic ring log. Routes: `/subscribe`, `/sync`, `/unsubscribe`, `/test`, and public no-secret `/status`. A one-minute cron sends due rows and purges invalid subscriptions. Apple delivery must use RFC 8291 `aes128gcm`; legacy `aesgcm` silently fails. Cover encryption with a round-trip test.
+Cloudflare Worker + D1 stores subscriptions, encrypted-at-rest pending payloads, and a diagnostic ring log. Routes: `/subscribe`, `/sync`, `/unsubscribe`, `/test`, and public no-secret `/status`; diagnostics expose counts, times, and delivery codes but never task text. A one-minute cron decrypts only the due payload in memory, sends it, and purges invalid subscriptions. Apple delivery must use RFC 8291 `aes128gcm`; legacy `aesgcm` silently fails. Cover encryption with a round-trip test.
 
 ## Verification and known traps
 

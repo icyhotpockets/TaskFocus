@@ -1,0 +1,93 @@
+name: Deploy iPhone Push Worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "worker/**"
+      - ".github/workflows/worker.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: taskfocus-push-worker
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy Worker and D1 schedule
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Check Cloudflare configuration
+        id: configured
+        run: |
+          if [ -n "${CLOUDFLARE_API_TOKEN}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID}" ] && [ -n "${VAPID_PRIVATE_KEY}" ]; then
+            echo "ready=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "ready=false" >> "${GITHUB_OUTPUT}"
+            echo "::notice title=iPhone push awaits Cloudflare secrets::Add CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, and VAPID_PRIVATE_KEY to repository Actions secrets. Android and Pages builds are unaffected."
+          fi
+
+      - name: Set up Node.js
+        if: steps.configured.outputs.ready == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Install pinned Worker dependencies
+        if: steps.configured.outputs.ready == 'true'
+        working-directory: worker
+        run: npm ci
+
+      - name: Create or locate the D1 database
+        if: steps.configured.outputs.ready == 'true'
+        id: database
+        working-directory: worker
+        run: |
+          DATABASES="$(curl -fsSL -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database")"
+          DATABASE_ID="$(printf '%s' "${DATABASES}" | jq -r '.result[] | select(.name == "taskfocus-push") | .uuid' | head -n 1)"
+          if [ -z "${DATABASE_ID}" ]; then
+            DATABASE_ID="$(curl -fsSL -X POST -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" -H "Content-Type: application/json" --data '{"name":"taskfocus-push"}' "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database" | jq -r '.result.uuid')"
+          fi
+          if [ -z "${DATABASE_ID}" ]; then
+            echo "::error title=D1 setup failed::Could not create or locate taskfocus-push."
+            exit 1
+          fi
+          sed -i "s/REPLACED_BY_CI/${DATABASE_ID}/" wrangler.toml
+          echo "database_id=${DATABASE_ID}" >> "${GITHUB_OUTPUT}"
+
+      - name: Apply idempotent D1 schema
+        if: steps.configured.outputs.ready == 'true'
+        working-directory: worker
+        run: npx wrangler d1 execute taskfocus-push --remote --file schema.sql
+
+      - name: Upload VAPID private key
+        if: steps.configured.outputs.ready == 'true'
+        working-directory: worker
+        run: printf '%s' "${VAPID_PRIVATE_KEY}" | npx wrangler secret put VAPID_PRIVATE_KEY
+
+      - name: Deploy one-minute push relay
+        if: steps.configured.outputs.ready == 'true'
+        id: deploy
+        working-directory: worker
+        run: npx wrangler deploy | tee /tmp/taskfocus-worker-deploy.txt
+
+      - name: Verify public diagnostics
+        if: steps.configured.outputs.ready == 'true'
+        run: |
+          SUBDOMAIN="$(curl -fsSL -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/subdomain" | jq -r '.result.subdomain')"
+          WORKER_URL="https://taskfocus-push.${SUBDOMAIN}.workers.dev"
+          curl --retry 6 --retry-delay 10 --retry-all-errors -fsSL "${WORKER_URL}/status" | jq -e '.ok == true'
+          echo "::notice title=TaskFocus push URL::${WORKER_URL}"

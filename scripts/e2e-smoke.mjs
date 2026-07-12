@@ -47,6 +47,20 @@ async function openTaskOption(dialog, option) {
   return panel;
 }
 
+async function setDurationWheel(page, dialog, field, totalMinutes) {
+  const row = dialog.locator(`[data-duration-field="${field}"]`);
+  await row.evaluate((element, total) => {
+    const values = { hours: Math.floor(total / 60), minutes: total % 60 };
+    for (const [unit, value] of Object.entries(values)) {
+      const wheel = element.querySelector(`[data-wheel-unit="${unit}"]`);
+      const item = wheel.querySelector(`[data-value="${value}"]`);
+      wheel.scrollTop = item.offsetTop - 72;
+      wheel.dispatchEvent(new Event('scroll'));
+    }
+  }, totalMinutes);
+  await page.waitForTimeout(180);
+}
+
 async function importBackupFile(page, contents, name = 'taskfocus-backup.json') {
   const chooserPromise = page.waitForEvent('filechooser');
   await page.locator('[data-action="import-backup"]').tap();
@@ -201,6 +215,69 @@ async function runNativeNotificationSmoke(browser, origin) {
   await context.close();
 }
 
+async function runWebPushSmoke(browser, origin) {
+  const calls = [];
+  const context = await browser.newContext({
+    viewport: { width: 412, height: 915 },
+    screen: { width: 412, height: 915 },
+    hasTouch: true,
+    isMobile: true,
+    serviceWorkers: 'block',
+  });
+  await context.addInitScript(() => {
+    const subscription = {
+      endpoint: 'https://apple.push.example/device',
+      keys: { auth: 'auth-key', p256dh: 'p256dh-key' },
+      toJSON() { return { endpoint: this.endpoint, keys: this.keys }; },
+      unsubscribe: async () => true,
+    };
+    class NotificationMock {
+      static permission = 'default';
+      static requestPermission() {
+        NotificationMock.permission = 'granted';
+        return Promise.resolve('granted');
+      }
+    }
+    Object.defineProperty(globalThis, 'Notification', { configurable: true, value: NotificationMock });
+    Object.defineProperty(globalThis, 'PushManager', { configurable: true, value: class PushManager {} });
+    Object.defineProperty(navigator, 'serviceWorker', {
+      configurable: true,
+      value: {
+        ready: Promise.resolve({
+          pushManager: {
+            getSubscription: async () => subscription,
+            subscribe: async () => subscription,
+          },
+        }),
+        register: async () => ({}),
+      },
+    });
+  });
+  await context.route('**/push-config.json*', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      workerUrl: 'https://push.test',
+      vapidPublicKey: 'BDbHQqC9eKYs8besRzUX3-30Q_UY2t9mi4xgvfwmN7VFAGQvQkHlhk2xbn2lAhrtILy1wicWICbvPRHpX0_tIOU',
+    }),
+  }));
+  await context.route('https://push.test/**', async (route) => {
+    calls.push({ path: new URL(route.request().url()).pathname, body: route.request().postDataJSON() });
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ ok: true }) });
+  });
+
+  const page = await context.newPage();
+  await page.goto(`${origin}/index.html#settings`, { waitUntil: 'networkidle' });
+  await page.locator('[data-action="enable-notifications"]').tap();
+  await page.getByRole('button', { name: 'Enabled', exact: true }).waitFor();
+  await page.waitForFunction(() => Notification.permission === 'granted');
+  assert.ok(calls.some(({ path }) => path === '/subscribe'));
+  assert.ok(calls.some(({ path }) => path === '/sync'));
+  await page.locator('[data-action="test-notification"]').tap();
+  await page.waitForFunction(() => document.querySelector('#toasts')?.textContent.includes('Test scheduled'));
+  assert.ok(calls.some(({ path }) => path === '/test'));
+  await context.close();
+}
+
 try {
   browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
@@ -325,10 +402,10 @@ try {
     await control.tap();
     assert.equal(await control.isChecked(), true, `${name} should turn on`);
   }
-  await optionPanel.locator('[data-field="interval-min"]').fill('45');
-  await optionPanel.locator('[data-field="timer-min"]').fill('50');
-  await optionPanel.locator('[data-field="work-min"]').fill('20');
-  await optionPanel.locator('[data-field="break-min"]').fill('10');
+  await setDurationWheel(page, optionPanel, 'interval-min', 45);
+  await setDurationWheel(page, optionPanel, 'timer-min', 50);
+  await setDurationWheel(page, optionPanel, 'work-min', 20);
+  await setDurationWheel(page, optionPanel, 'break-min', 10);
 
   optionPanel = await openTaskOption(editor, 'priority');
   await optionPanel.locator('[data-action="set-draft-priority"][data-priority="2"]').tap();
@@ -571,6 +648,7 @@ try {
   assert.deepEqual(failures, [], failures.join('\n'));
   await context.close();
   await runNativeNotificationSmoke(browser, origin);
+  await runWebPushSmoke(browser, origin);
 } finally {
   await browser?.close();
   await new Promise((resolveClose, reject) => {

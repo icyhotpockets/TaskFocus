@@ -36,6 +36,8 @@ jobs:
           node-version: 22
 
       - name: Stamp immutable build identity
+        env:
+          TASKFOCUS_PUSH_WORKER_URL: ${{ vars.TASKFOCUS_PUSH_WORKER_URL }}
         run: >-
           node scripts/stage-web.mjs
           --source www
